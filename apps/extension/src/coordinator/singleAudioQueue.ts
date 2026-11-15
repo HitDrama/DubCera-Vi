@@ -26,7 +26,7 @@ export class SingleAudioQueue {
     audioCacheKey: string;
     effectiveSpeechRate: number;
   } | null = null;
-  private rafHandle: number | null = null;
+  private progressTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private readonly onProgress?: (info: ActiveSegmentProgress | null) => void) {
     this.audioEl = new Audio();
@@ -90,9 +90,9 @@ export class SingleAudioQueue {
   }
 
   public stopImmediate(clearProgress = true): void {
-    if (this.rafHandle !== null) {
-      cancelAnimationFrame(this.rafHandle);
-      this.rafHandle = null;
+    if (this.progressTimer !== null) {
+      clearInterval(this.progressTimer);
+      this.progressTimer = null;
     }
     this.activeMeta = null;
     this.audioEl.pause();
@@ -143,9 +143,9 @@ export class SingleAudioQueue {
       const finish = () => {
         if (settled) return;
         settled = true;
-        if (this.rafHandle !== null) {
-          cancelAnimationFrame(this.rafHandle);
-          this.rafHandle = null;
+        if (this.progressTimer !== null) {
+          clearInterval(this.progressTimer);
+          this.progressTimer = null;
         }
         this.activeMeta = null;
         this.currentRejectOrFinish = null;
@@ -185,20 +185,23 @@ export class SingleAudioQueue {
         this.audioEl.addEventListener('loadedmetadata', applyOffsetIfNeeded, { once: true });
       }
 
-      const tickProgress = () => {
+      const emitTickProgress = () => {
         if (settled) return;
         const dur = this.audioEl.duration;
         if (Number.isFinite(dur) && dur > 0) {
           const ratio = Math.max(0, Math.min(1, this.audioEl.currentTime / dur));
           this.onProgress?.({ segmentIndex: params.segmentIndex, progressRatio: ratio });
         }
-        this.rafHandle = requestAnimationFrame(tickProgress);
       };
 
       this.audioEl.onended = () => finish();
       this.audioEl.onerror = () => {
         if (settled) return;
         settled = true;
+        if (this.progressTimer !== null) {
+          clearInterval(this.progressTimer);
+          this.progressTimer = null;
+        }
         this.activeMeta = null;
         this.currentRejectOrFinish = null;
         this.onProgress?.(null);
@@ -209,7 +212,8 @@ export class SingleAudioQueue {
         .play()
         .then(() => {
           if (!settled) {
-            this.rafHandle = requestAnimationFrame(tickProgress);
+            emitTickProgress();
+            this.progressTimer = setInterval(emitTickProgress, 90);
           }
         })
         .catch((err) => {

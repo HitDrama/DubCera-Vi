@@ -21,6 +21,7 @@ import {
   selectActiveDisplayChunk,
   sha256Hex,
   splitIntoDisplayChunks,
+  toSpokenVietnameseTtsText,
   type DisplayChunk,
   type PlaybackState,
   type SpeechSegment,
@@ -33,10 +34,13 @@ import { FreeWebTranslationProvider } from '../translation/freeWebProvider';
 import { LlmApiTranslationProvider } from '../translation/llmApiProvider';
 import {
   BUILTIN_CLOUD_ENGINE_ID,
-  BUILTIN_CLOUD_VOICE_ID,
   BuiltinCloudTtsClient,
 } from '../tts/builtinCloudTtsClient';
 import { LocalTtsClient } from '../tts/localTtsClient';
+import {
+  getBuiltinVoiceShortLabel,
+  resolveBuiltinFallbackVoiceId,
+} from '../tts/voiceTimbreProcessor';
 import { SingleAudioQueue, type PausedAudioBookmark } from './singleAudioQueue';
 
 export interface CoordinatorUiSnapshot {
@@ -67,10 +71,13 @@ export class AdaptiveSyncCoordinator {
   private workerAbortController = new AbortController();
 
   private playbackState: PlaybackState = createInitialPlaybackState();
+  private rawCues: SubtitleCue[] = [];
   private segments: SpeechSegment[] = [];
   private videoKey = '';
   private subtitleHash = '';
   private activeConfigVersion = '';
+  private activeTranslationSig = '';
+  private lastCacheInvalidatedAtMs = 0;
   private useBuiltinTts = true;
   private ttsDegradedSubtitleOnly = false;
   private bufferingMessage: string | null = null;
@@ -83,6 +90,7 @@ export class AdaptiveSyncCoordinator {
 
   private seekDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private pauseGraceTimer: ReturnType<typeof setTimeout> | null = null;
+  private persistDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private pauseGraceDeadlineMs = 0;
   private lastTimeUpdateWakeMs = 0;
   private hasPlayedInSession = false;
@@ -126,6 +134,7 @@ export class AdaptiveSyncCoordinator {
     );
     this.builtinTtsClient = new BuiltinCloudTtsClient(this.sessionTag);
     this.useBuiltinTts = settings.engineId === BUILTIN_CLOUD_ENGINE_ID;
+    this.lastCacheInvalidatedAtMs = settings.cacheInvalidatedAtMs || 0;
     this.audioQueue = new SingleAudioQueue((prog) => {
       if (!prog || this.disposed) return;
       const seg = this.segments[prog.segmentIndex];
@@ -151,14 +160,23 @@ export class AdaptiveSyncCoordinator {
     };
   }
 
+  private computeTranslationSignature(s: DubCeraSettings): string {
+    if (s.translationProvider !== 'free-web' && s.llmApiKey.trim()) {
+      return `${s.translationProvider}:${s.llmModel || 'default'}`;
+    }
+    return 'free-web-v3';
+  }
+
   public async initializeWithCues(cues: SubtitleCue[]): Promise<void> {
     if (this.disposed) return;
+    this.rawCues = cues;
     this.attachVideoListeners();
     const configSnap = toSynthesisConfigSnapshot(this.settings);
     this.activeConfigVersion = computeConfigVersion(configSnap);
+    this.activeTranslationSig = this.computeTranslationSignature(this.settings);
 
     this.subtitleHash = sha256Hex(
-      `grouper-v2|${cues.map((c) => `${c.startMs}-${c.endMs}:${c.rawText}`).join('|')}`,
+      `grouper-v3|${this.activeTranslationSig}|${cues.map((c) => `${c.startMs}-${c.endMs}:${c.rawText}`).join('|')}`,
     ).slice(0, 24);
     this.videoKey = buildVideoManifestKey({
       platform: this.platform,
@@ -223,19 +241,32 @@ export class AdaptiveSyncCoordinator {
   public async updateSettings(nextSettings: DubCeraSettings): Promise<void> {
     if (this.disposed) return;
     const prevConfigVer = this.activeConfigVersion;
+    const prevTransSig = this.activeTranslationSig;
+    const prevEngineId = this.settings.engineId;
+    const prevVoiceId = this.settings.voiceId;
+    const prevSampleRate = this.settings.sampleRate;
+    const cacheWasInvalidated =
+      (nextSettings.cacheInvalidatedAtMs || 0) !== this.lastCacheInvalidatedAtMs;
+    this.lastCacheInvalidatedAtMs = nextSettings.cacheInvalidatedAtMs || 0;
+
     this.settings = nextSettings;
     this.ttsClient.updateCredentials(nextSettings.localTtsUrl, nextSettings.localTtsToken);
 
+    const nextTransSig = this.computeTranslationSignature(nextSettings);
     const nextConfigIsBuiltin = nextSettings.engineId === BUILTIN_CLOUD_ENGINE_ID;
     const configSnap = nextConfigIsBuiltin
       ? toSynthesisConfigSnapshot({
           ...nextSettings,
           engineId: BUILTIN_CLOUD_ENGINE_ID,
-          voiceId: BUILTIN_CLOUD_VOICE_ID,
+          voiceId: resolveBuiltinFallbackVoiceId(nextSettings.engineId, nextSettings.voiceId),
           sampleRate: 24000,
         })
       : toSynthesisConfigSnapshot(nextSettings);
     const nextComputedVer = computeConfigVersion(configSnap);
+    const voiceSelectionChanged =
+      prevEngineId !== nextSettings.engineId ||
+      prevVoiceId !== nextSettings.voiceId ||
+      prevSampleRate !== nextSettings.sampleRate;
 
     if (!nextSettings.enabled) {
       // User turned DubCera OFF -> kill all background work & free memory immediately!
@@ -254,7 +285,18 @@ export class AdaptiveSyncCoordinator {
       return;
     }
 
-    if (prevConfigVer !== nextComputedVer) {
+    if ((prevTransSig !== nextTransSig || cacheWasInvalidated) && this.rawCues.length > 0) {
+      this.pausedBookmark = null;
+      this.playbackState = recordSeekInitiated(this.playbackState);
+      this.abortBackgroundWorkImmediately();
+      this.audioQueue.stopImmediate();
+      this.audioQueue.clearBlobCache();
+      this.detachVideoListeners();
+      await this.initializeWithCues(this.rawCues);
+      return;
+    }
+
+    if (voiceSelectionChanged || prevConfigVer !== nextComputedVer) {
       this.pausedBookmark = null;
       this.playbackState = recordSeekInitiated(this.playbackState);
       this.abortBackgroundWorkImmediately();
@@ -268,6 +310,17 @@ export class AdaptiveSyncCoordinator {
         const alignedMs = this.alignPlayheadToSentenceStart();
         this.triggerBackgroundWorkers();
         void this.coordinateAtPlayhead(alignedMs);
+      } else {
+        const builtinVariant = resolveBuiltinFallbackVoiceId(
+          this.settings.engineId,
+          this.settings.voiceId,
+        );
+        const builtinLabel = getBuiltinVoiceShortLabel(builtinVariant);
+        this.statusBanner = this.useBuiltinTts
+          ? this.settings.engineId !== BUILTIN_CLOUD_ENGINE_ID
+            ? `Server VieNeu đang tắt — Sẽ phát bằng giọng ${builtinLabel}`
+            : `Đã chọn giọng: ${builtinLabel} — Bấm Play để nghe`
+          : `Đã chọn giọng: ${this.settings.voiceId} — Bấm Play để nghe`;
       }
     } else if (!this.video.paused) {
       this.hasPlayedInSession = true;
@@ -317,6 +370,10 @@ export class AdaptiveSyncCoordinator {
     if (this.seekDebounceTimer) {
       clearTimeout(this.seekDebounceTimer);
       this.seekDebounceTimer = null;
+    }
+    if (this.persistDebounceTimer) {
+      clearTimeout(this.persistDebounceTimer);
+      this.persistDebounceTimer = null;
     }
     this.clearPauseGraceTimer();
     this.abortBackgroundWorkImmediately();
@@ -516,9 +573,15 @@ export class AdaptiveSyncCoordinator {
       clearTimeout(this.seekDebounceTimer);
       this.seekDebounceTimer = null;
     }
-    const alignedMs = this.alignPlayheadToSentenceStart();
-    this.triggerBackgroundWorkers();
-    void this.coordinateAtPlayhead(alignedMs);
+    void (async () => {
+      if (this.settings.engineId !== BUILTIN_CLOUD_ENGINE_ID && this.useBuiltinTts) {
+        await this.verifyDiskCacheAndHealth();
+      }
+      if (this.disposed || this.playbackState.intent !== 'PLAY') return;
+      const alignedMs = this.alignPlayheadToSentenceStart();
+      this.triggerBackgroundWorkers();
+      await this.coordinateAtPlayhead(alignedMs);
+    })();
   }
 
   private handleNativePauseEvent(): void {
@@ -651,10 +714,14 @@ export class AdaptiveSyncCoordinator {
 
   private getEffectiveSynthesisSnapshot() {
     if (this.useBuiltinTts) {
+      const effectiveVoice = resolveBuiltinFallbackVoiceId(
+        this.settings.engineId,
+        this.settings.voiceId,
+      );
       return toSynthesisConfigSnapshot({
         ...this.settings,
         engineId: BUILTIN_CLOUD_ENGINE_ID,
-        voiceId: BUILTIN_CLOUD_VOICE_ID,
+        voiceId: effectiveVoice,
         sampleRate: 24000,
       });
     }
@@ -734,11 +801,13 @@ export class AdaptiveSyncCoordinator {
   }
 
   private getTranslationProvider(): TranslationProvider {
-    if (this.settings.translationProvider === 'openai-compatible' && this.settings.llmEndpointUrl.trim()) {
+    if (this.settings.translationProvider !== 'free-web' && this.settings.llmApiKey.trim()) {
       return new LlmApiTranslationProvider({
+        provider: this.settings.translationProvider,
         endpointUrl: this.settings.llmEndpointUrl,
         apiKey: this.settings.llmApiKey,
-        model: this.settings.llmModel || 'gpt-4o-mini',
+        model: this.settings.llmModel,
+        sessionTag: this.sessionTag,
       });
     }
     return new FreeWebTranslationProvider(this.sessionTag);
@@ -798,6 +867,7 @@ export class AdaptiveSyncCoordinator {
 
         const firstIdx = batchIndices[0]!;
         const contextBefore: string[] = [];
+        if (firstIdx >= 3) contextBefore.push(this.segments[firstIdx - 3]!.sourceText);
         if (firstIdx >= 2) contextBefore.push(this.segments[firstIdx - 2]!.sourceText);
         if (firstIdx >= 1) contextBefore.push(this.segments[firstIdx - 1]!.sourceText);
 
@@ -808,15 +878,21 @@ export class AdaptiveSyncCoordinator {
 
         try {
           const provider = this.getTranslationProvider();
+          const pageTitle = typeof document !== 'undefined' ? document.title.replace(/\s*-\s*YouTube$/i, '').trim() : '';
           const translatedItems = await provider.translateBatch(
             {
-              sourceLang: 'en',
+              sourceLang: 'auto',
               targetLang: 'vi',
+              videoTitle: pageTitle || undefined,
               contextBefore,
-              items: batchIndices.map((idx) => ({
-                segmentId: this.segments[idx]!.segmentId,
-                sourceText: this.segments[idx]!.sourceText,
-              })),
+              items: batchIndices.map((idx) => {
+                const segItem = this.segments[idx]!;
+                return {
+                  segmentId: segItem.segmentId,
+                  sourceText: segItem.sourceText,
+                  durationMs: Math.max(800, segItem.endMs - segItem.startMs),
+                };
+              }),
             },
             signal,
           );
@@ -917,9 +993,14 @@ export class AdaptiveSyncCoordinator {
 
         try {
           if (this.useBuiltinTts) {
+            const voiceVariant = resolveBuiltinFallbackVoiceId(
+              this.settings.engineId,
+              this.settings.voiceId,
+            );
             const builtinRes = await this.builtinTtsClient.synthesizeAndCache({
               audioCacheKey: targetSeg.audioCacheKey!,
               text: targetSeg.translatedText!,
+              voiceVariant,
               minValidTimestampMs: this.settings.cacheInvalidatedAtMs,
               signal,
             });
@@ -954,7 +1035,7 @@ export class AdaptiveSyncCoordinator {
           } else {
             const synthRes = await this.ttsClient.synthesize({
               audioCacheKey: targetSeg.audioCacheKey!,
-              text: targetSeg.translatedText!,
+              text: toSpokenVietnameseTtsText(targetSeg.translatedText!) || targetSeg.translatedText!,
               voiceId: this.settings.voiceId,
               engineId: this.settings.engineId,
               sampleRate: this.settings.sampleRate,
@@ -1098,7 +1179,16 @@ export class AdaptiveSyncCoordinator {
     }
 
     this.video.volume = Math.max(0, Math.min(1, this.settings.originalVideoVolumeRatio));
-    this.statusBanner = 'Đang phát lồng tiếng Việt';
+    const activeBuiltinVariant = resolveBuiltinFallbackVoiceId(
+      this.settings.engineId,
+      this.settings.voiceId,
+    );
+    const activeBuiltinLabel = getBuiltinVoiceShortLabel(activeBuiltinVariant);
+    this.statusBanner = this.useBuiltinTts
+      ? this.settings.engineId !== BUILTIN_CLOUD_ENGINE_ID
+        ? `Server VieNeu đang tắt — Đang đọc tạm giọng ${activeBuiltinLabel}`
+        : `Đang phát giọng: ${activeBuiltinLabel} (Không cần Server)`
+      : `Đang phát giọng: ${this.settings.voiceId}`;
     this.emitSnapshot();
 
     for (let idx = startIdx; idx < this.segments.length; idx++) {
@@ -1219,6 +1309,10 @@ export class AdaptiveSyncCoordinator {
               const fresh = await this.builtinTtsClient.synthesizeAndCache({
                 audioCacheKey: seg.audioCacheKey,
                 text: seg.translatedText!,
+                voiceVariant: resolveBuiltinFallbackVoiceId(
+                  this.settings.engineId,
+                  this.settings.voiceId,
+                ),
                 minValidTimestampMs: this.settings.cacheInvalidatedAtMs,
                 signal: this.workerAbortController.signal,
               });
@@ -1279,18 +1373,26 @@ export class AdaptiveSyncCoordinator {
     this.emitSnapshot();
   }
 
-  private async persistCurrentManifest(): Promise<void> {
-    if (!this.videoKey || this.disposed) return;
-    await saveVideoManifest({
-      videoKey: this.videoKey,
-      platform: this.platform,
-      canonicalVideoId: this.canonicalVideoId,
-      subtitleHash: this.subtitleHash,
-      targetLang: 'vi',
-      activeConfigVersion: this.activeConfigVersion,
-      updatedAtMs: Date.now(),
-      segments: toPersistedSegments(this.segments),
-    });
+  private persistCurrentManifest(): Promise<void> {
+    if (!this.videoKey || this.disposed) return Promise.resolve();
+    if (this.persistDebounceTimer) {
+      clearTimeout(this.persistDebounceTimer);
+    }
+    this.persistDebounceTimer = setTimeout(() => {
+      this.persistDebounceTimer = null;
+      if (!this.videoKey || this.disposed) return;
+      void saveVideoManifest({
+        videoKey: this.videoKey,
+        platform: this.platform,
+        canonicalVideoId: this.canonicalVideoId,
+        subtitleHash: this.subtitleHash,
+        targetLang: 'vi',
+        activeConfigVersion: this.activeConfigVersion,
+        updatedAtMs: Date.now(),
+        segments: toPersistedSegments(this.segments),
+      });
+    }, 350);
+    return Promise.resolve();
   }
 
   private emitSnapshot(): void {
@@ -1309,7 +1411,7 @@ export class AdaptiveSyncCoordinator {
       readyCount,
       translatedCount,
       totalSegments: this.segments.length,
-      segments: [...this.segments],
+      segments: this.segments,
     });
   }
 }

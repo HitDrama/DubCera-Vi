@@ -13,6 +13,7 @@ import {
   type DubCeraSettings,
 } from '../src/storage/settingsStore';
 import { BufferingBadge } from '../src/ui/BufferingBadge';
+import { PlayerSettingsPopover } from '../src/ui/PlayerSettingsPopover';
 import { SubtitleOverlay } from '../src/ui/SubtitleOverlay';
 
 export default defineContentScript({
@@ -25,6 +26,9 @@ export default defineContentScript({
     let shadowHost: HTMLDivElement | null = null;
     let reactRoot: Root | null = null;
     let playerToggleBtn: HTMLButtonElement | null = null;
+    let lastButtonRenderKey = '';
+    let settingsPopoverOpen = false;
+    let settingsInitialized = false;
     let currentSettings: DubCeraSettings = DEFAULT_SETTINGS;
     let lastCacheInvalidatedAtMs = 0;
     let latestSnapshot: CoordinatorUiSnapshot | null = null;
@@ -114,20 +118,26 @@ export default defineContentScript({
       })();
     }
 
-    function handleQuickEngineSwitch(): void {
-      void (async () => {
-        const switchingToLocal = currentSettings.engineId === 'builtin-cloud-vi';
-        currentSettings = await saveSettings(
-          switchingToLocal
-            ? { engineId: 'vieneu-onnx', voiceId: 'Hải Đăng', sampleRate: 48000, enabled: true }
-            : { engineId: 'builtin-cloud-vi', voiceId: 'vi-standard', sampleRate: 24000, enabled: true },
-        );
-        if (coordinator) {
-          await coordinator.updateSettings(currentSettings);
+    function togglePlayerSettingsPopover(): void {
+      settingsPopoverOpen = !settingsPopoverOpen;
+      if (settingsPopoverOpen && !reactRoot) {
+        const pageVideo = activeVideo ?? (document.querySelector('video') as HTMLVideoElement | null);
+        if (pageVideo) {
+          mountOverlayContainer(pageVideo);
         }
-        updatePlayerToggleButtonAppearance();
-        renderOverlayUI();
-      })();
+      }
+      updatePlayerToggleButtonAppearance();
+      renderOverlayUI();
+    }
+
+    async function handleInlineSettingsUpdate(patch: Partial<DubCeraSettings>): Promise<void> {
+      currentSettings = await saveSettings(patch);
+      syncNativeCcVisibility();
+      if (coordinator) {
+        await coordinator.updateSettings(currentSettings);
+      }
+      updatePlayerToggleButtonAppearance();
+      renderOverlayUI();
     }
 
     function updatePlayerToggleButtonAppearance(): void {
@@ -135,10 +145,15 @@ export default defineContentScript({
 
       const isEnabled = currentSettings.enabled;
       const { badgeText, accentColor } = computeBadgeVisuals();
+      const renderKey = `${isEnabled}|${badgeText}|${accentColor}|${settingsPopoverOpen}|${latestSnapshot?.statusBanner ?? ''}`;
+      if (renderKey === lastButtonRenderKey && playerToggleBtn.childElementCount > 0) {
+        return;
+      }
+      lastButtonRenderKey = renderKey;
 
       playerToggleBtn.title = isEnabled
-        ? `DubCera đang BẬT (${latestSnapshot?.statusBanner ?? 'Giọng: ' + currentSettings.voiceId}) — Bấm để Tắt | Chuột phải đổi Nhanh/Chuẩn`
-        : 'DubCera đang TẮT — Bấm để Bật lồng tiếng Việt';
+        ? `DubCera đang BẬT (${latestSnapshot?.statusBanner ?? 'Giọng: ' + currentSettings.voiceId}) — Bấm chữ để Tắt | Bấm ⚙ (hoặc chuột phải) để chọn Giọng & Bộ dịch`
+        : 'DubCera đang TẮT — Bấm để Bật | Bấm ⚙ (hoặc chuột phải) để chọn Giọng & Bộ dịch';
 
       // Build DOM nodes without innerHTML so strict TrustedHTML CSP never blocks rendering
       playerToggleBtn.replaceChildren();
@@ -148,7 +163,7 @@ export default defineContentScript({
         'display:inline-flex',
         'align-items:center',
         'gap:5px',
-        'padding:3px 9px',
+        'padding:3px 8px',
         'border-radius:6px',
         "font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif",
         'font-size:11.5px',
@@ -168,8 +183,20 @@ export default defineContentScript({
       const label = document.createElement('span');
       label.textContent = `DC · ${badgeText}`;
 
+      const sep = document.createElement('span');
+      sep.style.cssText = 'opacity:0.45;margin:0 1px;font-weight:400;';
+      sep.textContent = '|';
+
+      const gear = document.createElement('span');
+      gear.setAttribute('data-dc-gear', '1');
+      gear.title = 'Mở Cài đặt Giọng đọc & Bộ dịch';
+      gear.style.cssText = `font-size:12.5px;line-height:1;padding:0 2px;color:${settingsPopoverOpen ? '#38BDF8' : '#E2E8F0'};`;
+      gear.textContent = '⚙';
+
       pill.appendChild(dot);
       pill.appendChild(label);
+      pill.appendChild(sep);
+      pill.appendChild(gear);
       playerToggleBtn.appendChild(pill);
     }
 
@@ -254,13 +281,18 @@ export default defineContentScript({
       btn.addEventListener('click', (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
+        const targetEl = ev.target as HTMLElement | null;
+        if (targetEl?.closest('[data-dc-gear="1"]')) {
+          togglePlayerSettingsPopover();
+          return;
+        }
         handleToggleClick();
       });
 
       btn.addEventListener('contextmenu', (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        handleQuickEngineSwitch();
+        togglePlayerSettingsPopover();
       });
 
       const beforeEl = ytRightControls ? ytRightControls.firstChild : (udemyAnchor?.beforeNode ?? null);
@@ -326,9 +358,9 @@ export default defineContentScript({
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                handleQuickEngineSwitch();
+                togglePlayerSettingsPopover();
               }}
-              title="Bấm để Bật/Tắt DubCera | Chuột phải đổi Nhanh/Chuẩn"
+              title="Bấm để Bật/Tắt DubCera | Chuột phải mở Cài đặt Giọng đọc"
               style={{
                 position: 'absolute',
                 top: '14px',
@@ -371,6 +403,20 @@ export default defineContentScript({
             autoplayBlocked={latestSnapshot?.playbackState.autoplayBlocked ?? false}
             onExplicitPause={() => coordinator?.requestExplicitUserPause()}
             onResumeAutoplay={() => void coordinator?.resumeAfterAutoplayBlock()}
+          />
+          <PlayerSettingsPopover
+            open={settingsPopoverOpen}
+            settings={currentSettings}
+            onUpdateSettings={handleInlineSettingsUpdate}
+            onClose={() => {
+              settingsPopoverOpen = false;
+              updatePlayerToggleButtonAppearance();
+              if (!currentSettings.enabled) {
+                cleanupCurrentSession();
+              } else {
+                renderOverlayUI();
+              }
+            }}
           />
         </React.StrictMode>,
       );
@@ -608,9 +654,10 @@ export default defineContentScript({
     }
 
     async function tryAttachToPageVideo(): Promise<void> {
-      currentSettings = await loadSettings();
-      if (lastCacheInvalidatedAtMs === 0) {
+      if (!settingsInitialized) {
+        currentSettings = await loadSettings();
         lastCacheInvalidatedAtMs = currentSettings.cacheInvalidatedAtMs;
+        settingsInitialized = true;
       }
       ensurePlayerControlBarButton();
 
@@ -629,7 +676,12 @@ export default defineContentScript({
       if (!video) return;
 
       if (!currentSettings.enabled) {
-        if (coordinator || shadowHost) {
+        if (coordinator) {
+          coordinator.dispose();
+          coordinator = null;
+          latestSnapshot = null;
+        }
+        if (shadowHost && !settingsPopoverOpen) {
           cleanupCurrentSession();
         }
         activeVideoId = '';
@@ -735,9 +787,10 @@ export default defineContentScript({
     window.addEventListener('pagehide', () => cleanupCurrentSession());
     window.addEventListener('beforeunload', () => cleanupCurrentSession());
 
-    // Fast initial mount + SPA polling for both YouTube and Udemy Lecture Auto-Advance
+    // Fast initial mount + zero-IPC SPA check (skips hidden idle tabs completely)
     void tryAttachToPageVideo();
     setInterval(() => {
+      if (document.hidden && !coordinator) return;
       ensurePlayerControlBarButton();
       void tryAttachToPageVideo();
     }, 2000);

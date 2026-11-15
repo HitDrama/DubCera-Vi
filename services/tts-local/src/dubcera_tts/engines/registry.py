@@ -3,7 +3,6 @@ from __future__ import annotations
 from ..config import ServiceConfig
 from ..schemas import VoiceInfo
 from .base import SynthesisOutput, TTSEngine
-from .edge_hybrid import EdgeHybridEngine
 from .mock_tone import DeterministicToneEngine
 from .sherpa_piper import SherpaPiperEngine
 from .vieneu_onnx import VieNeuOnnxEngine
@@ -15,11 +14,10 @@ class EngineRegistry:
         self._engines: dict[str, TTSEngine] = {}
 
         candidates: list[TTSEngine] = [
-            VieNeuOnnxEngine(max_cpu_threads=config.max_cpu_threads, mode="v3turbo", precision="int8"),
             VieNeuOnnxEngine(max_cpu_threads=config.max_cpu_threads, mode="v3nano"),
+            VieNeuOnnxEngine(max_cpu_threads=config.max_cpu_threads, mode="v3turbo", precision="int8"),
             SherpaPiperEngine(models_dir=config.models_dir, max_cpu_threads=config.max_cpu_threads, execution_provider="cpu"),
             SherpaPiperEngine(models_dir=config.models_dir, max_cpu_threads=config.max_cpu_threads, execution_provider="directml"),
-            EdgeHybridEngine(),
             DeterministicToneEngine(),
         ]
         for eng in candidates:
@@ -32,13 +30,15 @@ class EngineRegistry:
     def list_all_voices(self) -> list[VoiceInfo]:
         voices: list[VoiceInfo] = []
         for eng in self._engines.values():
+            if eng.engine_id == "mock-tone" and len(self._engines) > 1:
+                continue
             voices.extend(eng.list_voices())
         return voices
 
     def resolve_engine(self, requested_engine_id: str) -> TTSEngine:
         if requested_engine_id in self._engines:
             return self._engines[requested_engine_id]
-        for fallback_id in ("vieneu-onnx", "vieneu-nano", "piper-vi-eco", "edge-hybrid", "mock-tone"):
+        for fallback_id in ("vieneu-nano", "vieneu-onnx", "piper-vi-eco", "mock-tone"):
             if fallback_id in self._engines:
                 return self._engines[fallback_id]
         raise RuntimeError("No TTS engine available")

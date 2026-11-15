@@ -33,8 +33,8 @@ def _trim_process_working_set() -> None:
 class VieNeuOnnxEngine(TTSEngine):
     """
     Official VieNeu-TTS v3 adapter supporting:
-    - `mode="v3turbo"` (48kHz, strong En-Vi code-switching for Unity/coding tutorials, CUDA or ONNX INT8/FP32)
-    - `mode="v3nano"` (24kHz, 48M ultra-light flow model specifically built for CPU Eco / weak laptops)
+    - `mode="v3nano"` (24kHz, ultra-light CPU Eco ~380MB RAM, auto-releases to ~50MB when idle)
+    - `mode="v3turbo"` (48kHz, studio quality multi-region voices, auto-releases to ~50MB when idle)
     """
 
     def __init__(self, max_cpu_threads: int, mode: str = "v3turbo", precision: str = "int8") -> None:
@@ -59,15 +59,36 @@ class VieNeuOnnxEngine(TTSEngine):
         if self._mode == "v3nano":
             return [
                 VoiceInfo(
-                    voiceId="Hải Đăng",
-                    displayName="VieNeu Nano - Hải Đăng (CPU Eco · Nhẹ & Nhanh)",
+                    voiceId="Minh Quân",
+                    displayName="VieNeu Nano — Minh Quân (Nam Bắc · Nhanh & Nhẹ RAM)",
+                    engineId=self.engine_id,
+                    sampleRate=24000,
+                    tier="local_eco",
+                ),
+                VoiceInfo(
+                    voiceId="Anh Khôi",
+                    displayName="VieNeu Nano — Anh Khôi (Nam Bắc Kể chuyện · Nhẹ RAM)",
+                    engineId=self.engine_id,
+                    sampleRate=24000,
+                    tier="local_eco",
+                ),
+                VoiceInfo(
+                    voiceId="Adam",
+                    displayName="VieNeu Nano — Adam (Nam miền Nam · Nhẹ RAM)",
                     engineId=self.engine_id,
                     sampleRate=24000,
                     tier="local_eco",
                 ),
                 VoiceInfo(
                     voiceId="Trúc Ly",
-                    displayName="VieNeu Nano - Trúc Ly (CPU Eco · Nữ Bắc)",
+                    displayName="VieNeu Nano — Trúc Ly (Nữ miền Bắc · Nhẹ RAM)",
+                    engineId=self.engine_id,
+                    sampleRate=24000,
+                    tier="local_eco",
+                ),
+                VoiceInfo(
+                    voiceId="Ái Hân",
+                    displayName="VieNeu Nano — Ái Hân (Nữ miền Nam · Nhẹ RAM)",
                     engineId=self.engine_id,
                     sampleRate=24000,
                     tier="local_eco",
@@ -77,28 +98,49 @@ class VieNeuOnnxEngine(TTSEngine):
         return [
             VoiceInfo(
                 voiceId="Hải Đăng",
-                displayName="VieNeu v3 Turbo - Hải Đăng (48kHz · Chuẩn Anh-Việt)",
-                engineId=self.engine_id,
-                sampleRate=48000,
-                tier="local_high",
-            ),
-            VoiceInfo(
-                voiceId="Trúc Ly",
-                displayName="VieNeu v3 Turbo - Trúc Ly (48kHz · Nữ Bắc tự nhiên)",
+                displayName="VieNeu Turbo — Hải Đăng (Nam miền Bắc · 48kHz)",
                 engineId=self.engine_id,
                 sampleRate=48000,
                 tier="local_high",
             ),
             VoiceInfo(
                 voiceId="Thiện Minh",
-                displayName="VieNeu v3 Turbo - Thiện Minh (48kHz · Kể chuyện/Bài giảng)",
+                displayName="VieNeu Turbo — Thiện Minh (Nam trầm Bài giảng · 48kHz)",
+                engineId=self.engine_id,
+                sampleRate=48000,
+                tier="local_high",
+            ),
+            VoiceInfo(
+                voiceId="Thái Sơn",
+                displayName="VieNeu Turbo — Thái Sơn (Nam miền Nam · 48kHz)",
+                engineId=self.engine_id,
+                sampleRate=48000,
+                tier="local_high",
+            ),
+            VoiceInfo(
+                voiceId="Quang Sơn",
+                displayName="VieNeu Turbo — Quang Sơn (Nam miền Trung · 48kHz)",
+                engineId=self.engine_id,
+                sampleRate=48000,
+                tier="local_high",
+            ),
+            VoiceInfo(
+                voiceId="Trúc Ly",
+                displayName="VieNeu Turbo — Trúc Ly (Nữ miền Bắc · 48kHz)",
                 engineId=self.engine_id,
                 sampleRate=48000,
                 tier="local_high",
             ),
             VoiceInfo(
                 voiceId="Thùy Dung",
-                displayName="VieNeu v3 Turbo - Thùy Dung (48kHz · Nữ miền Nam)",
+                displayName="VieNeu Turbo — Thùy Dung (Nữ miền Nam · 48kHz)",
+                engineId=self.engine_id,
+                sampleRate=48000,
+                tier="local_high",
+            ),
+            VoiceInfo(
+                voiceId="Ngọc Trân",
+                displayName="VieNeu Turbo — Ngọc Trân (Nữ miền Trung · 48kHz)",
                 engineId=self.engine_id,
                 sampleRate=48000,
                 tier="local_high",
@@ -134,18 +176,19 @@ class VieNeuOnnxEngine(TTSEngine):
         self._last_used_monotonic = time.monotonic()
         tts = await self._ensure_loaded()
         native_sr = int(getattr(tts, "sample_rate", 24000 if self._mode == "v3nano" else 48000))
+        default_voice = "Minh Quân" if self._mode == "v3nano" else "Hải Đăng"
 
         async with self._infer_lock:
             self._last_used_monotonic = time.monotonic()
+
             def _run_sync() -> tuple[np.ndarray, int]:
-                voice_arg = None if voice_id in ("", "default", "vieneu-default") else voice_id
+                requested = default_voice if voice_id in ("", "default", "vieneu-default") else voice_id
                 try:
-                    if voice_arg:
-                        audio_obj = tts.infer(text=text, voice=voice_arg)
-                    else:
-                        audio_obj = tts.infer(text=text)
+                    preset = tts.get_preset_voice(requested)
+                    audio_obj = tts.infer(text=text, voice=preset)
                 except Exception:
-                    audio_obj = tts.infer(text=text)
+                    preset = tts.get_preset_voice(default_voice)
+                    audio_obj = tts.infer(text=text, voice=preset)
 
                 if isinstance(audio_obj, np.ndarray):
                     return audio_obj.astype(np.float32), native_sr

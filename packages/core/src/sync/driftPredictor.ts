@@ -1,6 +1,10 @@
 import type { DriftPredictionResult, SyncMode } from '../contracts/playback';
 import type { SpeechSegment } from '../contracts/subtitle';
-import { mapVideoTimeToAudioClock, planSegmentDualClock } from './dualClockPlanner';
+import {
+  countVietnameseSyllables,
+  mapVideoTimeToAudioClock,
+  planSegmentDualClock,
+} from './dualClockPlanner';
 
 export interface DriftPredictionInput {
   nowClockMs: number;
@@ -9,6 +13,7 @@ export interface DriftPredictionInput {
   prevAudioEndClockMs: number;
   upcomingSegments: SpeechSegment[]; // Slice of next 3-5 segments starting from current/next
   syncMode: SyncMode;
+  minEffectiveSpeechRate?: number;
   maxEffectiveSpeechRate?: number;
 }
 
@@ -31,7 +36,11 @@ export function predictLookaheadDrift(input: DriftPredictionInput): DriftPredict
   let simulatedPrevEndClock = input.prevAudioEndClockMs;
   let maxDriftClockMs = 0;
 
-  for (const seg of windowSegments) {
+  for (let i = 0; i < windowSegments.length; i++) {
+    const seg = windowSegments[i]!;
+    const prevSeg = i > 0 ? windowSegments[i - 1] : undefined;
+    const isContinuousFromPrev = Boolean(prevSeg?.continuesImmediately && simulatedPrevEndClock > 0);
+
     const plan = planSegmentDualClock({
       nowClockMs: input.nowClockMs,
       currentVideoTimeMs: input.currentVideoTimeMs,
@@ -41,7 +50,14 @@ export function predictLookaheadDrift(input: DriftPredictionInput): DriftPredict
       segmentEndVideoMs: seg.endMs,
       nextSegmentStartVideoMs: seg.nextSegmentStartMs,
       audioDurationMs: seg.audioDurationMs!,
+      minEffectiveSpeechRate: input.minEffectiveSpeechRate,
       maxEffectiveSpeechRate: input.maxEffectiveSpeechRate,
+      flowProfile: seg.flowProfile,
+      syllableCount: countVietnameseSyllables(seg.translatedText),
+      allowEarlyLeadInClockMs: isContinuousFromPrev
+        ? 420 / Math.max(0.5, input.userVideoRate)
+        : 0,
+      minBreathGapClockMs: isContinuousFromPrev ? 160 : 60,
     });
 
     simulatedPrevEndClock = plan.expectedEndClockMs;

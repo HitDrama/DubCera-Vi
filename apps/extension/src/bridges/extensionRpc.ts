@@ -16,10 +16,24 @@ export type DubCeraRpcRequest =
       voiceId: string;
       engineId: string;
       sampleRate: number;
+      sessionTag?: string;
     }
-  | { type: 'TTS_FETCH_AUDIO_B64'; baseUrl: string; token: string; audioCacheKey: string }
-  | { type: 'FREE_WEB_TRANSLATE'; sourceLang: string; targetLang: string; query: string }
-  | { type: 'FETCH_SUBTITLE_TEXT'; url: string };
+  | {
+      type: 'TTS_FETCH_AUDIO_B64';
+      baseUrl: string;
+      token: string;
+      audioCacheKey: string;
+      sessionTag?: string;
+    }
+  | {
+      type: 'FREE_WEB_TRANSLATE';
+      sourceLang: string;
+      targetLang: string;
+      query: string;
+      sessionTag?: string;
+    }
+  | { type: 'FETCH_SUBTITLE_TEXT'; url: string }
+  | { type: 'ABORT_SESSION_REQUESTS'; sessionTag: string };
 
 export type DubCeraRpcResponse<T = unknown> =
   | { ok: true; data: T }

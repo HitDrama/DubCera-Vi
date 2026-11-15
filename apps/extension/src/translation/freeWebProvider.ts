@@ -46,6 +46,8 @@ function unmaskGlossaryTerms(
 export class FreeWebTranslationProvider implements TranslationProvider {
   public readonly providerId = 'free-web';
 
+  constructor(private readonly sessionTag?: string) {}
+
   private async runTranslateQuery(
     query: string,
     sourceLang: string,
@@ -58,6 +60,7 @@ export class FreeWebTranslationProvider implements TranslationProvider {
         sourceLang: sourceLang || 'auto',
         targetLang: targetLang || 'vi',
         query,
+        sessionTag: this.sessionTag,
       });
     }
 

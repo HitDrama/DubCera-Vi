@@ -38,12 +38,27 @@ export interface SynthesizeResult {
   audioUrl: string;
 }
 
+export interface ClearDiskCacheResult {
+  deletedCount: number;
+  freedBytes: number;
+}
+
 export class LocalTtsClient {
   constructor(
     private baseUrl: string,
     private authToken: string,
+    private readonly sessionTag?: string,
   ) {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
+  }
+
+  public abortActiveSessionRequests(): void {
+    if (this.sessionTag && isContentScriptContext()) {
+      void sendBackgroundRpc({
+        type: 'ABORT_SESSION_REQUESTS',
+        sessionTag: this.sessionTag,
+      }).catch(() => {});
+    }
   }
 
   public updateCredentials(baseUrl: string, authToken: string): void {
@@ -125,6 +140,7 @@ export class LocalTtsClient {
         voiceId: params.voiceId,
         engineId: params.engineId,
         sampleRate: params.sampleRate,
+        sessionTag: this.sessionTag,
       });
     }
 
@@ -158,6 +174,7 @@ export class LocalTtsClient {
         baseUrl: this.baseUrl,
         token: this.authToken,
         audioCacheKey,
+        sessionTag: this.sessionTag,
       });
       return base64ToWavBlobUrl(b64);
     }
@@ -172,5 +189,16 @@ export class LocalTtsClient {
     }
     const blob = await resp.blob();
     return URL.createObjectURL(blob);
+  }
+
+  public async clearDiskCache(): Promise<ClearDiskCacheResult> {
+    const resp = await fetch(`${this.baseUrl}/v1/cache/clear`, {
+      method: 'POST',
+      headers: this.headers,
+    });
+    if (!resp.ok) {
+      throw new Error(`Clear cache HTTP ${resp.status}`);
+    }
+    return (await resp.json()) as ClearDiskCacheResult;
   }
 }

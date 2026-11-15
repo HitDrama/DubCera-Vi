@@ -1,5 +1,47 @@
 import type { DubCeraRpcRequest, DubCeraRpcResponse } from '../src/bridges/extensionRpc';
 
+const activeSessionControllers = new Map<string, Set<AbortController>>();
+
+function registerSessionController(sessionTag?: string): {
+  controller: AbortController;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  if (!sessionTag) {
+    return { controller, cleanup: () => {} };
+  }
+  let group = activeSessionControllers.get(sessionTag);
+  if (!group) {
+    group = new Set<AbortController>();
+    activeSessionControllers.set(sessionTag, group);
+  }
+  group.add(controller);
+  return {
+    controller,
+    cleanup: () => {
+      const current = activeSessionControllers.get(sessionTag);
+      if (current) {
+        current.delete(controller);
+        if (current.size === 0) {
+          activeSessionControllers.delete(sessionTag);
+        }
+      }
+    },
+  };
+}
+
+function abortSessionControllers(sessionTag: string): number {
+  const group = activeSessionControllers.get(sessionTag);
+  if (!group) return 0;
+  let count = 0;
+  for (const ctrl of group) {
+    ctrl.abort();
+    count += 1;
+  }
+  activeSessionControllers.delete(sessionTag);
+  return count;
+}
+
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
   const chunkSize = 0x8000;
@@ -12,6 +54,10 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 
 async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
   switch (msg.type) {
+    case 'ABORT_SESSION_REQUESTS': {
+      return { aborted: abortSessionControllers(msg.sessionTag) };
+    }
+
     case 'TTS_HEALTH': {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), msg.timeoutMs ?? 3500);
@@ -42,59 +88,79 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
     }
 
     case 'TTS_SYNTHESIZE': {
-      const resp = await fetch(`${msg.baseUrl.replace(/\/+$/, '')}/v1/synthesize`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-DubCera-Token': msg.token,
-        },
-        body: JSON.stringify({
-          audioCacheKey: msg.audioCacheKey,
-          text: msg.text,
-          targetLang: 'vi',
-          voiceId: msg.voiceId,
-          engineId: msg.engineId,
-          modelVersion: 'v1',
-          sampleRate: msg.sampleRate,
-          styleOrPitchConfig: 'default',
-          pauseConfig: 'default',
-        }),
-      });
-      if (!resp.ok) {
-        const detail = await resp.text().catch(() => '');
-        throw new Error(`TTS synthesize HTTP ${resp.status}: ${detail}`);
+      const { controller, cleanup } = registerSessionController(msg.sessionTag);
+      try {
+        const resp = await fetch(`${msg.baseUrl.replace(/\/+$/, '')}/v1/synthesize`, {
+          method: 'POST',
+          signal: controller.signal,
+          headers: {
+            'Content-Type': 'application/json',
+            'X-DubCera-Token': msg.token,
+          },
+          body: JSON.stringify({
+            audioCacheKey: msg.audioCacheKey,
+            text: msg.text,
+            targetLang: 'vi',
+            voiceId: msg.voiceId,
+            engineId: msg.engineId,
+            modelVersion: 'v1',
+            sampleRate: msg.sampleRate,
+            styleOrPitchConfig: 'default',
+            pauseConfig: 'default',
+          }),
+        });
+        if (!resp.ok) {
+          const detail = await resp.text().catch(() => '');
+          throw new Error(`TTS synthesize HTTP ${resp.status}: ${detail}`);
+        }
+        return await resp.json();
+      } finally {
+        cleanup();
       }
-      return await resp.json();
     }
 
     case 'TTS_FETCH_AUDIO_B64': {
-      const resp = await fetch(
-        `${msg.baseUrl.replace(/\/+$/, '')}/v1/audio/${msg.audioCacheKey}`,
-        {
-          method: 'GET',
-          headers: { 'X-DubCera-Token': msg.token },
-        },
-      );
-      if (!resp.ok) throw new Error(`Audio fetch HTTP ${resp.status}`);
-      const buf = await resp.arrayBuffer();
-      return arrayBufferToBase64(buf);
+      const { controller, cleanup } = registerSessionController(msg.sessionTag);
+      try {
+        const resp = await fetch(
+          `${msg.baseUrl.replace(/\/+$/, '')}/v1/audio/${msg.audioCacheKey}`,
+          {
+            method: 'GET',
+            signal: controller.signal,
+            headers: { 'X-DubCera-Token': msg.token },
+          },
+        );
+        if (!resp.ok) throw new Error(`Audio fetch HTTP ${resp.status}`);
+        const buf = await resp.arrayBuffer();
+        return arrayBufferToBase64(buf);
+      } finally {
+        cleanup();
+      }
     }
 
     case 'FREE_WEB_TRANSLATE': {
-      const url = new URL('https://translate.googleapis.com/translate_a/single');
-      url.searchParams.set('client', 'gtx');
-      url.searchParams.set('sl', msg.sourceLang || 'auto');
-      url.searchParams.set('tl', msg.targetLang || 'vi');
-      url.searchParams.set('dt', 't');
-      url.searchParams.set('q', msg.query);
+      const { controller, cleanup } = registerSessionController(msg.sessionTag);
+      try {
+        const url = new URL('https://translate.googleapis.com/translate_a/single');
+        url.searchParams.set('client', 'gtx');
+        url.searchParams.set('sl', msg.sourceLang || 'auto');
+        url.searchParams.set('tl', msg.targetLang || 'vi');
+        url.searchParams.set('dt', 't');
+        url.searchParams.set('q', msg.query);
 
-      const resp = await fetch(url.toString(), { method: 'GET' });
-      if (!resp.ok) throw new Error(`Translate HTTP ${resp.status}`);
-      const rawJson = (await resp.json()) as unknown;
-      const parts = Array.isArray(rawJson) && Array.isArray(rawJson[0]) ? (rawJson[0] as unknown[]) : [];
-      return parts
-        .map((p) => (Array.isArray(p) && typeof p[0] === 'string' ? p[0] : ''))
-        .join('');
+        const resp = await fetch(url.toString(), {
+          method: 'GET',
+          signal: controller.signal,
+        });
+        if (!resp.ok) throw new Error(`Translate HTTP ${resp.status}`);
+        const rawJson = (await resp.json()) as unknown;
+        const parts = Array.isArray(rawJson) && Array.isArray(rawJson[0]) ? (rawJson[0] as unknown[]) : [];
+        return parts
+          .map((p) => (Array.isArray(p) && typeof p[0] === 'string' ? p[0] : ''))
+          .join('');
+      } finally {
+        cleanup();
+      }
     }
 
     case 'FETCH_SUBTITLE_TEXT': {
@@ -139,7 +205,7 @@ export default defineBackground(() => {
             error: err instanceof Error ? err.message : String(err),
           }),
         );
-      return true; // Keep async message channel open
+      return true;
     },
   );
 });

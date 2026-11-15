@@ -4,6 +4,7 @@ import { parseVtt, type SubtitleCue } from '@dubcera/core';
 import { parseYouTubeTimedTextPayload } from '../src/adapters/youtube/youtubeTimedTextParser';
 import { sendBackgroundRpc } from '../src/bridges/extensionRpc';
 import { AdaptiveSyncCoordinator, type CoordinatorUiSnapshot } from '../src/coordinator/syncCoordinator';
+import { clearAllVideoManifests } from '../src/storage/manifestDb';
 import {
   DEFAULT_SETTINGS,
   loadSettings,
@@ -24,6 +25,7 @@ export default defineContentScript({
     let reactRoot: Root | null = null;
     let playerToggleBtn: HTMLButtonElement | null = null;
     let currentSettings: DubCeraSettings = DEFAULT_SETTINGS;
+    let lastCacheInvalidatedAtMs = 0;
     let latestSnapshot: CoordinatorUiSnapshot | null = null;
     let captionState: 'IDLE' | 'LOADING' | 'READY' | 'MISSING' = 'IDLE';
     let missingRetryCount = 0;
@@ -602,6 +604,9 @@ export default defineContentScript({
 
     async function tryAttachToPageVideo(): Promise<void> {
       currentSettings = await loadSettings();
+      if (lastCacheInvalidatedAtMs === 0) {
+        lastCacheInvalidatedAtMs = currentSettings.cacheInvalidatedAtMs;
+      }
       ensurePlayerControlBarButton();
 
       const meta = resolvePlatformAndVideoId();
@@ -670,7 +675,26 @@ export default defineContentScript({
 
     chrome.storage?.onChanged?.addListener(() => {
       void (async () => {
-        currentSettings = await loadSettings();
+        const nextSettings = await loadSettings();
+        const cacheWasCleared = nextSettings.cacheInvalidatedAtMs > lastCacheInvalidatedAtMs;
+        currentSettings = nextSettings;
+        lastCacheInvalidatedAtMs = nextSettings.cacheInvalidatedAtMs;
+
+        if (cacheWasCleared) {
+          // Wipe this origin's IndexedDB manifest cache & reset active coordinator from scratch
+          await clearAllVideoManifests();
+          cleanupCurrentSession();
+          activeVideoId = '';
+          missingRetryCount = 0;
+          syncNativeCcVisibility();
+          updatePlayerToggleButtonAppearance();
+          renderOverlayUI();
+          if (currentSettings.enabled) {
+            await tryAttachToPageVideo();
+          }
+          return;
+        }
+
         syncNativeCcVisibility();
         updatePlayerToggleButtonAppearance();
         renderOverlayUI();
@@ -689,6 +713,10 @@ export default defineContentScript({
       missingRetryCount = 0;
       setTimeout(() => void tryAttachToPageVideo(), 500);
     });
+
+    // Immediately abort all background TTS/Translation & free memory if user closes tab or navigates away
+    window.addEventListener('pagehide', () => cleanupCurrentSession());
+    window.addEventListener('beforeunload', () => cleanupCurrentSession());
 
     // Fast initial mount + SPA polling for both YouTube and Udemy Lecture Auto-Advance
     void tryAttachToPageVideo();

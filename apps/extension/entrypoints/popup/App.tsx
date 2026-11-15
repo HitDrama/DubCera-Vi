@@ -1,12 +1,27 @@
 import React, { useEffect, useState } from 'react';
 import type { SubtitleDisplayMode, SyncMode } from '@dubcera/core';
-import { DEFAULT_SETTINGS, loadSettings, saveSettings, type DubCeraSettings } from '../../src/storage/settingsStore';
+import { clearAllVideoManifests } from '../../src/storage/manifestDb';
+import {
+  DEFAULT_SETTINGS,
+  loadSettings,
+  saveSettings,
+  type DubCeraSettings,
+} from '../../src/storage/settingsStore';
 import { LocalTtsClient, type LocalVoiceOption } from '../../src/tts/localTtsClient';
+
+function formatBytesToMb(bytes: number): string {
+  if (bytes <= 0) return '0 MB';
+  const mb = bytes / (1024 * 1024);
+  if (mb < 0.1) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${mb.toFixed(1)} MB`;
+}
 
 export const App: React.FC = () => {
   const [settings, setSettings] = useState<DubCeraSettings>(DEFAULT_SETTINGS);
   const [voices, setVoices] = useState<LocalVoiceOption[]>([]);
   const [serverOnline, setServerOnline] = useState<boolean | null>(null);
+  const [clearingCache, setClearingCache] = useState(false);
+  const [cacheNotice, setCacheNotice] = useState<string | null>(null);
 
   useEffect(() => {
     void (async () => {
@@ -33,6 +48,34 @@ export const App: React.FC = () => {
     chrome.tabs.create({ url });
   };
 
+  const handleClearAllCache = async () => {
+    if (clearingCache) return;
+    setClearingCache(true);
+    setCacheNotice(null);
+
+    try {
+      // 1. Wipe extension-origin IndexedDB + broadcast invalidation epoch to all open & future tabs (YouTube/Udemy)
+      await clearAllVideoManifests();
+      const next = await saveSettings({ cacheInvalidatedAtMs: Date.now() });
+      setSettings(next);
+
+      // 2. Wipe local disk TTS WAV + metadata cache if Local TTS service is online
+      const client = new LocalTtsClient(next.localTtsUrl, next.localTtsToken);
+      try {
+        const diskRes = await client.clearDiskCache();
+        setCacheNotice(
+          `Đã xóa sạch ${diskRes.deletedCount} file voice (${formatBytesToMb(diskRes.freedBytes)}) & toàn bộ cache bản dịch.`,
+        );
+      } catch {
+        setCacheNotice(
+          'Đã xóa toàn bộ cache bản dịch trên trình duyệt (khởi động lại Local TTS nếu muốn dọn thêm file .wav trên ổ đĩa).',
+        );
+      }
+    } finally {
+      setClearingCache(false);
+    }
+  };
+
   return (
     <div
       style={{
@@ -42,12 +85,27 @@ export const App: React.FC = () => {
         fontSize: '13px',
       }}
     >
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: '12px',
+        }}
+      >
         <div>
           <div style={{ fontSize: '16px', fontWeight: 700, color: '#38BDF8' }}>DubCera</div>
           <div style={{ fontSize: '11px', color: '#94A3B8' }}>Every word. Perfectly synced.</div>
         </div>
-        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontWeight: 600 }}>
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            cursor: 'pointer',
+            fontWeight: 600,
+          }}
+        >
           <input
             type="checkbox"
             checked={settings.enabled}
@@ -77,7 +135,9 @@ export const App: React.FC = () => {
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
         <div>
-          <label style={{ display: 'block', marginBottom: '4px', color: '#CBD5E1', fontWeight: 600 }}>
+          <label
+            style={{ display: 'block', marginBottom: '4px', color: '#CBD5E1', fontWeight: 600 }}
+          >
             Giọng đọc & Chế độ Phần cứng
           </label>
           <select
@@ -99,21 +159,30 @@ export const App: React.FC = () => {
           >
             {voices.length > 0 ? (
               voices.map((v) => (
-                <option key={`${v.engineId}-${v.voiceId}`} value={`${v.engineId}::${v.voiceId}::${v.sampleRate}`}>
+                <option
+                  key={`${v.engineId}-${v.voiceId}`}
+                  value={`${v.engineId}::${v.voiceId}::${v.sampleRate}`}
+                >
                   {v.displayName}
                 </option>
               ))
             ) : (
               <>
-                <option value="vieneu-onnx::Hải Đăng::48000">VieNeu v3 Turbo - Hải Đăng (48kHz · Chuẩn Anh-Việt)</option>
-                <option value="vieneu-nano::Hải Đăng::24000">VieNeu Nano - Hải Đăng (CPU Eco · Máy yếu)</option>
+                <option value="vieneu-onnx::Hải Đăng::48000">
+                  VieNeu v3 Turbo - Hải Đăng (48kHz · Chuẩn Anh-Việt)
+                </option>
+                <option value="vieneu-nano::Hải Đăng::24000">
+                  VieNeu Nano - Hải Đăng (CPU Eco · Máy yếu)
+                </option>
               </>
             )}
           </select>
         </div>
 
         <div>
-          <label style={{ display: 'block', marginBottom: '4px', color: '#CBD5E1', fontWeight: 600 }}>
+          <label
+            style={{ display: 'block', marginBottom: '4px', color: '#CBD5E1', fontWeight: 600 }}
+          >
             Chế độ Đồng bộ Hình – Tiếng
           </label>
           <select
@@ -128,13 +197,17 @@ export const App: React.FC = () => {
               border: '1px solid #334155',
             }}
           >
-            <option value="LEARNING_HOLD_VIDEO">Ưu tiên đọc đủ (Cho phép giữ nhịp video khi câu dài)</option>
+            <option value="LEARNING_HOLD_VIDEO">
+              Ưu tiên đọc đủ (Cho phép giữ nhịp video khi câu dài)
+            </option>
             <option value="STRICT_VIDEO_SPEED">Giữ cứng tốc độ video gốc</option>
           </select>
         </div>
 
         <div>
-          <label style={{ display: 'block', marginBottom: '4px', color: '#CBD5E1', fontWeight: 600 }}>
+          <label
+            style={{ display: 'block', marginBottom: '4px', color: '#CBD5E1', fontWeight: 600 }}
+          >
             Hiển thị Phụ đề (1–2 dòng gọn)
           </label>
           <select
@@ -157,9 +230,45 @@ export const App: React.FC = () => {
 
         <button
           type="button"
+          onClick={() => void handleClearAllCache()}
+          disabled={clearingCache}
+          style={{
+            marginTop: '4px',
+            padding: '8px 12px',
+            borderRadius: '8px',
+            border: '1px solid rgba(248, 113, 113, 0.45)',
+            background: clearingCache ? 'rgba(127, 29, 29, 0.3)' : 'rgba(239, 68, 68, 0.16)',
+            color: '#FCA5A5',
+            fontWeight: 700,
+            cursor: clearingCache ? 'wait' : 'pointer',
+          }}
+        >
+          {clearingCache
+            ? 'Đang dọn dẹp toàn bộ Cache...'
+            : 'Xóa sạch Cache (Bản dịch & Giọng đọc)'}
+        </button>
+
+        {cacheNotice && (
+          <div
+            style={{
+              padding: '7px 9px',
+              borderRadius: '6px',
+              fontSize: '11.5px',
+              lineHeight: 1.4,
+              background: 'rgba(56, 189, 248, 0.12)',
+              border: '1px solid rgba(56, 189, 248, 0.35)',
+              color: '#BAE6FD',
+            }}
+          >
+            {cacheNotice}
+          </div>
+        )}
+
+        <button
+          type="button"
           onClick={openSandbox}
           style={{
-            marginTop: '6px',
+            marginTop: '2px',
             padding: '9px 12px',
             borderRadius: '8px',
             border: 'none',

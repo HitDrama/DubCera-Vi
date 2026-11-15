@@ -33,6 +33,7 @@ export interface VideoManifestRecord {
   subtitleHash: string;
   targetLang: string;
   activeConfigVersion: string;
+  createdAtMs?: number;
   updatedAtMs: number;
   segments: PersistedSegmentRecord[];
 }

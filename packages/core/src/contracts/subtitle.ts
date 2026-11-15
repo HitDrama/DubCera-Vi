@@ -22,13 +22,22 @@ export type SegmentStatus =
   | 'READY'
   | 'ERROR';
 
+export type SegmentFlowProfile =
+  | 'CONTINUOUS_FLOW'
+  | 'STANDALONE_NORMAL'
+  | 'SHORT_UTTERANCE';
+
 export interface SpeechSegment {
   segmentIndex: number;
   segmentId: string;
   sourceCueIds: string[];
-  startMs: number;              // videoTimeMs axis
-  endMs: number;                // videoTimeMs axis
+  startMs: number;              // videoTimeMs axis (interpolated at sub-cue precision when split)
+  endMs: number;                // videoTimeMs axis (interpolated at sub-cue precision when split)
   nextSegmentStartMs: number | null;
+  gapFromPrevMs?: number | null;
+  gapToNextMs?: number | null;
+  continuesImmediately?: boolean;
+  flowProfile?: SegmentFlowProfile;
   sourceText: string;
   translatedText?: string;
   displayChunks?: DisplayChunk[];

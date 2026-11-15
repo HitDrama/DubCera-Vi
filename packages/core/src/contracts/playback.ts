@@ -1,3 +1,5 @@
+import type { SegmentFlowProfile } from './subtitle';
+
 export type PlaybackIntent = 'PLAY' | 'PAUSE';
 
 export type SyncMode = 'LEARNING_HOLD_VIDEO' | 'STRICT_VIDEO_SPEED';
@@ -24,7 +26,11 @@ export interface DualClockScheduleInput {
   segmentEndVideoMs: number;
   nextSegmentStartVideoMs: number | null;
   audioDurationMs: number;      // Real 1.0x PCM duration
+  minEffectiveSpeechRate?: number; // Adaptive slow-fill floor (e.g. 0.80 for continuous flow)
   maxEffectiveSpeechRate?: number;
+  flowProfile?: SegmentFlowProfile;
+  syllableCount?: number;       // Vietnamese syllable count to prevent < 3.1 syll/s slurring
+  allowEarlyLeadInClockMs?: number; // Smooth lead-in bridge across continuous adjacent segments
   minBreathGapClockMs?: number;
   maxSilenceBorrowVideoMs?: number;
 }

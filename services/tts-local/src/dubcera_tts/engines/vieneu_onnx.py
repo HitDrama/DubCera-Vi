@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import gc
 import importlib.util
+import sys
 import tempfile
+import time
 import wave
 from pathlib import Path
 
@@ -10,6 +14,20 @@ import numpy as np
 
 from ..schemas import VoiceInfo
 from .base import SynthesisOutput, TTSEngine
+
+
+def _trim_process_working_set() -> None:
+    gc.collect()
+    if sys.platform == "win32":
+        try:
+            k32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+            psapi.EmptyWorkingSet.restype = ctypes.c_int
+            psapi.EmptyWorkingSet(k32.GetCurrentProcess())
+        except Exception:
+            pass
 
 
 class VieNeuOnnxEngine(TTSEngine):
@@ -24,6 +42,7 @@ class VieNeuOnnxEngine(TTSEngine):
         self._mode = mode  # "v3turbo" or "v3nano"
         self._precision = precision
         self._instance = None
+        self._last_used_monotonic = 0.0
         self._init_lock = asyncio.Lock()
         self._infer_lock = asyncio.Lock()
 
@@ -112,10 +131,12 @@ class VieNeuOnnxEngine(TTSEngine):
             return self._instance
 
     async def synthesize(self, text: str, voice_id: str, sample_rate: int = 48000) -> SynthesisOutput:
+        self._last_used_monotonic = time.monotonic()
         tts = await self._ensure_loaded()
         native_sr = int(getattr(tts, "sample_rate", 24000 if self._mode == "v3nano" else 48000))
 
         async with self._infer_lock:
+            self._last_used_monotonic = time.monotonic()
             def _run_sync() -> tuple[np.ndarray, int]:
                 voice_arg = None if voice_id in ("", "default", "vieneu-default") else voice_id
                 try:
@@ -151,4 +172,23 @@ class VieNeuOnnxEngine(TTSEngine):
                     tmp_path.unlink(missing_ok=True)
 
             samples, detected_sr = await asyncio.to_thread(_run_sync)
+            self._last_used_monotonic = time.monotonic()
             return SynthesisOutput(samples=samples, sample_rate=detected_sr, engine_id=self.engine_id)
+
+    async def unload_if_idle(self, max_idle_seconds: float = 60.0) -> bool:
+        if self._instance is None:
+            return False
+        if self._infer_lock.locked() or self._init_lock.locked():
+            return False
+        if time.monotonic() - self._last_used_monotonic < max_idle_seconds:
+            return False
+
+        async with self._init_lock:
+            async with self._infer_lock:
+                if self._instance is None:
+                    return False
+                if time.monotonic() - self._last_used_monotonic < max_idle_seconds:
+                    return False
+                self._instance = None
+                await asyncio.to_thread(_trim_process_working_set)
+                return True

@@ -26,6 +26,12 @@ export type DubCeraRpcRequest =
       sessionTag?: string;
     }
   | {
+      type: 'BUILTIN_TTS_SYNTHESIZE';
+      text: string;
+      targetLang?: string;
+      sessionTag?: string;
+    }
+  | {
       type: 'FREE_WEB_TRANSLATE';
       sourceLang: string;
       targetLang: string;
@@ -33,6 +39,7 @@ export type DubCeraRpcRequest =
       sessionTag?: string;
     }
   | { type: 'FETCH_SUBTITLE_TEXT'; url: string }
+  | { type: 'TTS_RELEASE_MEMORY'; baseUrl: string; token: string }
   | { type: 'ABORT_SESSION_REQUESTS'; sessionTag: string };
 
 export type DubCeraRpcResponse<T = unknown> =
@@ -59,13 +66,18 @@ export async function sendBackgroundRpc<T>(req: DubCeraRpcRequest): Promise<T> {
   return resp.data;
 }
 
-export function base64ToWavBlobUrl(base64: string): string {
+export function base64ToAudioBytes(base64: string): Uint8Array {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
-  const blob = new Blob([bytes], { type: 'audio/wav' });
+  return bytes;
+}
+
+export function base64ToWavBlobUrl(base64: string, mimeType = 'audio/wav'): string {
+  const bytes = base64ToAudioBytes(base64);
+  const blob = new Blob([bytes.buffer as ArrayBuffer], { type: mimeType });
   return URL.createObjectURL(blob);
 }
 

@@ -38,10 +38,16 @@ def create_app(custom_config: ServiceConfig | None = None) -> FastAPI:
         cache_store.enforce_quota()
 
         async def _periodic_cache_reaper() -> None:
+            ticks = 0
             while True:
-                await asyncio.sleep(600)
+                await asyncio.sleep(20)
+                ticks += 1
                 try:
-                    await asyncio.to_thread(cache_store.enforce_quota)
+                    # Release ~1 GB ONNX model RAM automatically after 60s of inactivity
+                    await registry.unload_idle_models(max_idle_seconds=60.0)
+                    # Sweep expired (>1 day) and >5 GB disk cache every 10 minutes (30 * 20s)
+                    if ticks % 30 == 0:
+                        await asyncio.to_thread(cache_store.enforce_quota)
                 except Exception:
                     pass
 
@@ -120,7 +126,14 @@ def create_app(custom_config: ServiceConfig | None = None) -> FastAPI:
     async def clear_cache(request: Request) -> CacheClearResponse:
         verify_request_security(request, config)
         deleted_count, freed_bytes = cache_store.clear_all()
+        await registry.unload_idle_models(max_idle_seconds=0.0)
         return CacheClearResponse(deletedCount=deleted_count, freedBytes=freed_bytes)
+
+    @app.post("/v1/memory/release")
+    async def release_memory(request: Request) -> dict[str, int]:
+        verify_request_security(request, config)
+        unloaded = await registry.unload_idle_models(max_idle_seconds=0.0)
+        return {"unloadedEngines": unloaded}
 
     @app.post("/v1/synthesize", response_model=SynthesizeResponse)
     async def synthesize_speech(payload: SynthesizeRequest, request: Request) -> SynthesizeResponse:

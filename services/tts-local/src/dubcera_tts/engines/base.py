@@ -28,3 +28,7 @@ class TTSEngine(ABC):
 
     @abstractmethod
     async def synthesize(self, text: str, voice_id: str, sample_rate: int) -> SynthesisOutput: ...
+
+    async def unload_if_idle(self, max_idle_seconds: float) -> bool:
+        """Optional hook to release heavy ONNX weights from RAM when idle."""
+        return False

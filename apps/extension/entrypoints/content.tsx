@@ -4,6 +4,7 @@ import { parseVtt, type SubtitleCue } from '@dubcera/core';
 import { parseYouTubeTimedTextPayload } from '../src/adapters/youtube/youtubeTimedTextParser';
 import { sendBackgroundRpc } from '../src/bridges/extensionRpc';
 import { AdaptiveSyncCoordinator, type CoordinatorUiSnapshot } from '../src/coordinator/syncCoordinator';
+import { clearAllBuiltinAudioCache } from '../src/storage/builtinAudioCacheDb';
 import { clearAllVideoManifests } from '../src/storage/manifestDb';
 import {
   DEFAULT_SETTINGS,
@@ -96,26 +97,30 @@ export default defineContentScript({
         const nextEnabled = !currentSettings.enabled;
         currentSettings = await saveSettings({ enabled: nextEnabled });
         syncNativeCcVisibility();
-        updatePlayerToggleButtonAppearance();
-        renderOverlayUI();
 
-        if (coordinator) {
-          await coordinator.updateSettings(currentSettings);
-        } else if (nextEnabled) {
+        if (!nextEnabled) {
+          // Immediately destroy coordinator, unmount Shadow DOM & release all RAM!
+          cleanupCurrentSession();
           activeVideoId = '';
           missingRetryCount = 0;
-          await tryAttachToPageVideo();
+          updatePlayerToggleButtonAppearance();
+          return;
         }
+
+        activeVideoId = '';
+        missingRetryCount = 0;
+        updatePlayerToggleButtonAppearance();
+        await tryAttachToPageVideo();
       })();
     }
 
     function handleQuickEngineSwitch(): void {
       void (async () => {
-        const switchingToNano = currentSettings.engineId !== 'vieneu-nano';
+        const switchingToLocal = currentSettings.engineId === 'builtin-cloud-vi';
         currentSettings = await saveSettings(
-          switchingToNano
-            ? { engineId: 'vieneu-nano', voiceId: 'Hải Đăng', sampleRate: 24000, enabled: true }
-            : { engineId: 'vieneu-onnx', voiceId: 'Hải Đăng', sampleRate: 48000, enabled: true },
+          switchingToLocal
+            ? { engineId: 'vieneu-onnx', voiceId: 'Hải Đăng', sampleRate: 48000, enabled: true }
+            : { engineId: 'builtin-cloud-vi', voiceId: 'vi-standard', sampleRate: 24000, enabled: true },
         );
         if (coordinator) {
           await coordinator.updateSettings(currentSettings);
@@ -623,6 +628,15 @@ export default defineContentScript({
       const video = document.querySelector('video') as HTMLVideoElement | null;
       if (!video) return;
 
+      if (!currentSettings.enabled) {
+        if (coordinator || shadowHost) {
+          cleanupCurrentSession();
+        }
+        activeVideoId = '';
+        updatePlayerToggleButtonAppearance();
+        return;
+      }
+
       if (video === activeVideo && meta.videoId === activeVideoId) {
         mountOverlayContainer(video);
         if (coordinator || captionState === 'LOADING') return;
@@ -636,12 +650,6 @@ export default defineContentScript({
         activeVideoId = meta.videoId;
         missingRetryCount = 0;
         mountOverlayContainer(video);
-      }
-
-      if (!currentSettings.enabled) {
-        updatePlayerToggleButtonAppearance();
-        renderOverlayUI();
-        return;
       }
 
       if (meta.platform === 'youtube') {
@@ -681,8 +689,8 @@ export default defineContentScript({
         lastCacheInvalidatedAtMs = nextSettings.cacheInvalidatedAtMs;
 
         if (cacheWasCleared) {
-          // Wipe this origin's IndexedDB manifest cache & reset active coordinator from scratch
-          await clearAllVideoManifests();
+          // Wipe this origin's IndexedDB manifest + builtin MP3 audio cache & reset active coordinator
+          await Promise.all([clearAllVideoManifests(), clearAllBuiltinAudioCache()]);
           cleanupCurrentSession();
           activeVideoId = '';
           missingRetryCount = 0;
@@ -695,12 +703,21 @@ export default defineContentScript({
           return;
         }
 
+        if (!currentSettings.enabled) {
+          cleanupCurrentSession();
+          activeVideoId = '';
+          missingRetryCount = 0;
+          syncNativeCcVisibility();
+          updatePlayerToggleButtonAppearance();
+          return;
+        }
+
         syncNativeCcVisibility();
         updatePlayerToggleButtonAppearance();
         renderOverlayUI();
         if (coordinator) {
           await coordinator.updateSettings(currentSettings);
-        } else if (currentSettings.enabled) {
+        } else {
           activeVideoId = '';
           missingRetryCount = 0;
           await tryAttachToPageVideo();

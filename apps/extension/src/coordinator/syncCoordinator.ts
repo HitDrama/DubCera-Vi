@@ -31,6 +31,11 @@ import { loadVideoManifest, saveVideoManifest, toPersistedSegments } from '../st
 import { toSynthesisConfigSnapshot, type DubCeraSettings } from '../storage/settingsStore';
 import { FreeWebTranslationProvider } from '../translation/freeWebProvider';
 import { LlmApiTranslationProvider } from '../translation/llmApiProvider';
+import {
+  BUILTIN_CLOUD_ENGINE_ID,
+  BUILTIN_CLOUD_VOICE_ID,
+  BuiltinCloudTtsClient,
+} from '../tts/builtinCloudTtsClient';
 import { LocalTtsClient } from '../tts/localTtsClient';
 import { SingleAudioQueue, type PausedAudioBookmark } from './singleAudioQueue';
 
@@ -66,12 +71,14 @@ export class AdaptiveSyncCoordinator {
   private videoKey = '';
   private subtitleHash = '';
   private activeConfigVersion = '';
+  private useBuiltinTts = true;
   private ttsDegradedSubtitleOnly = false;
   private bufferingMessage: string | null = null;
   private statusBanner = 'Sẵn sàng';
   private activeChunk: DisplayChunk | null = null;
 
   private readonly ttsClient: LocalTtsClient;
+  private readonly builtinTtsClient: BuiltinCloudTtsClient;
   private readonly audioQueue: SingleAudioQueue;
 
   private seekDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -117,6 +124,8 @@ export class AdaptiveSyncCoordinator {
       settings.localTtsToken,
       this.sessionTag,
     );
+    this.builtinTtsClient = new BuiltinCloudTtsClient(this.sessionTag);
+    this.useBuiltinTts = settings.engineId === BUILTIN_CLOUD_ENGINE_ID;
     this.audioQueue = new SingleAudioQueue((prog) => {
       if (!prog || this.disposed) return;
       const seg = this.segments[prog.segmentIndex];
@@ -217,8 +226,16 @@ export class AdaptiveSyncCoordinator {
     this.settings = nextSettings;
     this.ttsClient.updateCredentials(nextSettings.localTtsUrl, nextSettings.localTtsToken);
 
-    const configSnap = toSynthesisConfigSnapshot(nextSettings);
-    this.activeConfigVersion = computeConfigVersion(configSnap);
+    const nextConfigIsBuiltin = nextSettings.engineId === BUILTIN_CLOUD_ENGINE_ID;
+    const configSnap = nextConfigIsBuiltin
+      ? toSynthesisConfigSnapshot({
+          ...nextSettings,
+          engineId: BUILTIN_CLOUD_ENGINE_ID,
+          voiceId: BUILTIN_CLOUD_VOICE_ID,
+          sampleRate: 24000,
+        })
+      : toSynthesisConfigSnapshot(nextSettings);
+    const nextComputedVer = computeConfigVersion(configSnap);
 
     if (!nextSettings.enabled) {
       // User turned DubCera OFF -> kill all background work & free memory immediately!
@@ -237,21 +254,13 @@ export class AdaptiveSyncCoordinator {
       return;
     }
 
-    if (prevConfigVer !== this.activeConfigVersion) {
+    if (prevConfigVer !== nextComputedVer) {
       this.pausedBookmark = null;
       this.playbackState = recordSeekInitiated(this.playbackState);
       this.abortBackgroundWorkImmediately();
       this.audioQueue.stopImmediate();
       this.audioQueue.clearBlobCache();
 
-      for (const seg of this.segments) {
-        seg.configVersion = this.activeConfigVersion;
-        if (seg.translatedText) {
-          seg.audioCacheKey = buildAudioCacheKey(seg.translatedText, configSnap);
-          seg.status = 'TRANSLATED';
-          seg.audioDurationMs = undefined;
-        }
-      }
       await this.verifyDiskCacheAndHealth();
       if (!this.video.paused) {
         this.hasPlayedInSession = true;
@@ -313,6 +322,10 @@ export class AdaptiveSyncCoordinator {
     this.abortBackgroundWorkImmediately();
     this.detachVideoListeners();
     this.audioQueue.dispose();
+    if (!this.useBuiltinTts) {
+      this.ttsClient.releaseServerMemory();
+    }
+    this.segments = [];
     this.video.volume = this.originalUserVideoVolume;
   }
 
@@ -345,7 +358,8 @@ export class AdaptiveSyncCoordinator {
       // Only cut off if still paused (and not actively buffering for an explicit Play intent)
       if (this.video.paused && !this.playbackState.isBuffering) {
         this.abortBackgroundWorkImmediately();
-        this.statusBanner = 'Đã tạm dừng >10s — Đã ngắt chạy ngầm để tiết kiệm tài nguyên';
+        this.audioQueue.clearBlobCache();
+        this.statusBanner = 'Đã tạm dừng >10s — Đã ngắt chạy ngầm & giải phóng RAM đệm';
         this.emitSnapshot();
       }
     }, PAUSE_GRACE_DURATION_MS + 50);
@@ -355,6 +369,7 @@ export class AdaptiveSyncCoordinator {
     this.workerAbortController.abort();
     this.workerAbortController = new AbortController();
     this.ttsClient.abortActiveSessionRequests();
+    this.builtinTtsClient.abortActiveSessionRequests();
 
     // Cleanly roll back any mid-flight transient statuses so pressing Play later retries cleanly
     for (const seg of this.segments) {
@@ -634,13 +649,50 @@ export class AdaptiveSyncCoordinator {
     }
   }
 
+  private getEffectiveSynthesisSnapshot() {
+    if (this.useBuiltinTts) {
+      return toSynthesisConfigSnapshot({
+        ...this.settings,
+        engineId: BUILTIN_CLOUD_ENGINE_ID,
+        voiceId: BUILTIN_CLOUD_VOICE_ID,
+        sampleRate: 24000,
+      });
+    }
+    return toSynthesisConfigSnapshot(this.settings);
+  }
+
+  private refreshSegmentAudioKeysForCurrentMode(): void {
+    const snap = this.getEffectiveSynthesisSnapshot();
+    this.activeConfigVersion = computeConfigVersion(snap);
+    for (const seg of this.segments) {
+      seg.configVersion = this.activeConfigVersion;
+      if (seg.translatedText) {
+        seg.audioCacheKey = buildAudioCacheKey(seg.translatedText, snap);
+        if (seg.status === 'READY') {
+          seg.status = 'TRANSLATED';
+          seg.audioDurationMs = undefined;
+        }
+      }
+    }
+  }
+
   private async verifyDiskCacheAndHealth(): Promise<void> {
-    try {
-      await this.ttsClient.checkHealth(3000);
+    if (this.settings.engineId === BUILTIN_CLOUD_ENGINE_ID) {
+      this.useBuiltinTts = true;
       this.ttsDegradedSubtitleOnly = false;
-    } catch {
-      this.ttsDegradedSubtitleOnly = true;
-      return;
+      this.refreshSegmentAudioKeysForCurrentMode();
+    } else {
+      try {
+        await this.ttsClient.checkHealth(1500);
+        this.useBuiltinTts = false;
+        this.ttsDegradedSubtitleOnly = false;
+        this.refreshSegmentAudioKeysForCurrentMode();
+      } catch {
+        // Local Python server is closed -> seamlessly fall back to Built-in Extension TTS (0 MB Python RAM!)
+        this.useBuiltinTts = true;
+        this.ttsDegradedSubtitleOnly = false;
+        this.refreshSegmentAudioKeysForCurrentMode();
+      }
     }
 
     const keysToCheck = this.segments
@@ -650,13 +702,29 @@ export class AdaptiveSyncCoordinator {
     if (keysToCheck.length === 0) return;
 
     try {
-      const validMap = await this.ttsClient.verifyCachedKeys(keysToCheck);
-      for (const seg of this.segments) {
-        if (seg.audioCacheKey) {
-          const hit = validMap[seg.audioCacheKey.toLowerCase()];
-          if (hit) {
-            seg.audioDurationMs = hit.audioDurationMs;
-            seg.status = 'READY';
+      if (this.useBuiltinTts) {
+        const validMap = await this.builtinTtsClient.verifyCachedKeys(
+          keysToCheck,
+          this.settings.cacheInvalidatedAtMs,
+        );
+        for (const seg of this.segments) {
+          if (seg.audioCacheKey) {
+            const hit = validMap[seg.audioCacheKey.toLowerCase()];
+            if (hit) {
+              seg.audioDurationMs = hit.audioDurationMs;
+              seg.status = 'READY';
+            }
+          }
+        }
+      } else {
+        const validMap = await this.ttsClient.verifyCachedKeys(keysToCheck);
+        for (const seg of this.segments) {
+          if (seg.audioCacheKey) {
+            const hit = validMap[seg.audioCacheKey.toLowerCase()];
+            if (hit) {
+              seg.audioDurationMs = hit.audioDurationMs;
+              seg.status = 'READY';
+            }
           }
         }
       }
@@ -762,7 +830,7 @@ export class AdaptiveSyncCoordinator {
             break;
           }
 
-          const configSnap = toSynthesisConfigSnapshot(this.settings);
+          const configSnap = this.getEffectiveSynthesisSnapshot();
           for (const item of translatedItems) {
             const seg = this.segments.find((s) => s.segmentId === item.segmentId);
             if (seg) {
@@ -848,37 +916,74 @@ export class AdaptiveSyncCoordinator {
         this.emitSnapshot();
 
         try {
-          const synthRes = await this.ttsClient.synthesize({
-            audioCacheKey: targetSeg.audioCacheKey!,
-            text: targetSeg.translatedText!,
-            voiceId: this.settings.voiceId,
-            engineId: this.settings.engineId,
-            sampleRate: this.settings.sampleRate,
-            signal,
-          });
+          if (this.useBuiltinTts) {
+            const builtinRes = await this.builtinTtsClient.synthesizeAndCache({
+              audioCacheKey: targetSeg.audioCacheKey!,
+              text: targetSeg.translatedText!,
+              minValidTimestampMs: this.settings.cacheInvalidatedAtMs,
+              signal,
+            });
 
-          if (this.disposed || signal.aborted) {
-            if (targetSeg.status === 'SYNTHESIZING') {
-              targetSeg.status = 'TRANSLATED';
-            }
-            break;
-          }
-
-          if (capturedCfgVersion === this.activeConfigVersion) {
-            targetSeg.audioDurationMs = synthRes.audioDurationMs;
-            targetSeg.status = 'READY';
-
-            if (
-              nextTtsTask.tier === 'P0_URGENT' &&
-              this.isBackgroundWorkAllowed() &&
-              !this.audioQueue.hasPreloaded(targetSeg.audioCacheKey!)
-            ) {
-              const blobUrl = await this.ttsClient.fetchAudioBlobUrl(targetSeg.audioCacheKey!, signal);
-              this.audioQueue.storePreloadedBlobUrl(targetSeg.audioCacheKey!, blobUrl);
+            if (this.disposed || signal.aborted) {
+              URL.revokeObjectURL(builtinRes.blobUrl);
+              if (targetSeg.status === 'SYNTHESIZING') {
+                targetSeg.status = 'TRANSLATED';
+              }
+              break;
             }
 
-            await this.persistCurrentManifest();
-            this.emitSnapshot();
+            if (capturedCfgVersion === this.activeConfigVersion) {
+              targetSeg.audioDurationMs = builtinRes.audioDurationMs;
+              targetSeg.status = 'READY';
+
+              if (
+                nextTtsTask.tier === 'P0_URGENT' &&
+                this.isBackgroundWorkAllowed() &&
+                !this.audioQueue.hasPreloaded(targetSeg.audioCacheKey!)
+              ) {
+                this.audioQueue.storePreloadedBlobUrl(targetSeg.audioCacheKey!, builtinRes.blobUrl);
+              } else {
+                URL.revokeObjectURL(builtinRes.blobUrl);
+              }
+
+              await this.persistCurrentManifest();
+              this.emitSnapshot();
+            } else {
+              URL.revokeObjectURL(builtinRes.blobUrl);
+            }
+          } else {
+            const synthRes = await this.ttsClient.synthesize({
+              audioCacheKey: targetSeg.audioCacheKey!,
+              text: targetSeg.translatedText!,
+              voiceId: this.settings.voiceId,
+              engineId: this.settings.engineId,
+              sampleRate: this.settings.sampleRate,
+              signal,
+            });
+
+            if (this.disposed || signal.aborted) {
+              if (targetSeg.status === 'SYNTHESIZING') {
+                targetSeg.status = 'TRANSLATED';
+              }
+              break;
+            }
+
+            if (capturedCfgVersion === this.activeConfigVersion) {
+              targetSeg.audioDurationMs = synthRes.audioDurationMs;
+              targetSeg.status = 'READY';
+
+              if (
+                nextTtsTask.tier === 'P0_URGENT' &&
+                this.isBackgroundWorkAllowed() &&
+                !this.audioQueue.hasPreloaded(targetSeg.audioCacheKey!)
+              ) {
+                const blobUrl = await this.ttsClient.fetchAudioBlobUrl(targetSeg.audioCacheKey!, signal);
+                this.audioQueue.storePreloadedBlobUrl(targetSeg.audioCacheKey!, blobUrl);
+              }
+
+              await this.persistCurrentManifest();
+              this.emitSnapshot();
+            }
           }
         } catch {
           if (this.disposed || signal.aborted || !this.isBackgroundWorkAllowed()) {
@@ -887,14 +992,20 @@ export class AdaptiveSyncCoordinator {
             }
             break;
           }
-          try {
-            await this.ttsClient.checkHealth(2000);
+          if (!this.useBuiltinTts) {
+            try {
+              await this.ttsClient.checkHealth(1500);
+              targetSeg.status = 'ERROR';
+              targetSeg.errorMessage = 'Lỗi tạo âm thanh câu này';
+            } catch {
+              // Local Python stopped mid-session -> seamlessly switch to Built-in Extension TTS!
+              this.useBuiltinTts = true;
+              this.refreshSegmentAudioKeysForCurrentMode();
+              this.statusBanner = 'Đã tự động chuyển sang Giọng đọc tích hợp sẵn trên Extension';
+            }
+          } else {
             targetSeg.status = 'ERROR';
-            targetSeg.errorMessage = 'Lỗi tạo âm thanh câu này';
-          } catch {
-            this.ttsDegradedSubtitleOnly = true;
-            this.video.volume = this.originalUserVideoVolume;
-            this.statusBanner = 'Mất kết nối Local TTS — Đã chuyển sang hiện Phụ đề tiếng Việt';
+            targetSeg.errorMessage = 'Lỗi kết nối giọng đọc trực tuyến';
           }
           this.emitSnapshot();
         }
@@ -1098,10 +1209,27 @@ export class AdaptiveSyncCoordinator {
       let blobUrl = this.audioQueue.getBlobUrl(seg.audioCacheKey);
       if (!blobUrl) {
         try {
-          blobUrl = await this.ttsClient.fetchAudioBlobUrl(
-            seg.audioCacheKey,
-            this.workerAbortController.signal,
-          );
+          if (this.useBuiltinTts) {
+            blobUrl =
+              (await this.builtinTtsClient.getCachedBlobUrl(
+                seg.audioCacheKey,
+                this.settings.cacheInvalidatedAtMs,
+              )) ?? undefined;
+            if (!blobUrl) {
+              const fresh = await this.builtinTtsClient.synthesizeAndCache({
+                audioCacheKey: seg.audioCacheKey,
+                text: seg.translatedText!,
+                minValidTimestampMs: this.settings.cacheInvalidatedAtMs,
+                signal: this.workerAbortController.signal,
+              });
+              blobUrl = fresh.blobUrl;
+            }
+          } else {
+            blobUrl = await this.ttsClient.fetchAudioBlobUrl(
+              seg.audioCacheKey,
+              this.workerAbortController.signal,
+            );
+          }
           this.audioQueue.storePreloadedBlobUrl(seg.audioCacheKey, blobUrl);
         } catch {
           continue;

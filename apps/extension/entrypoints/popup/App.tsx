@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import type { SubtitleDisplayMode, SyncMode } from '@dubcera/core';
+import { clearAllBuiltinAudioCache } from '../../src/storage/builtinAudioCacheDb';
 import { clearAllVideoManifests } from '../../src/storage/manifestDb';
 import {
   DEFAULT_SETTINGS,
@@ -7,6 +8,10 @@ import {
   saveSettings,
   type DubCeraSettings,
 } from '../../src/storage/settingsStore';
+import {
+  BUILTIN_CLOUD_ENGINE_ID,
+  BUILTIN_CLOUD_VOICE_ID,
+} from '../../src/tts/builtinCloudTtsClient';
 import { LocalTtsClient, type LocalVoiceOption } from '../../src/tts/localTtsClient';
 
 function formatBytesToMb(bytes: number): string {
@@ -29,7 +34,7 @@ export const App: React.FC = () => {
       setSettings(loaded);
       const client = new LocalTtsClient(loaded.localTtsUrl, loaded.localTtsToken);
       try {
-        const health = await client.checkHealth(2500);
+        const health = await client.checkHealth(1500);
         setVoices(health.availableVoices);
         setServerOnline(true);
       } catch {
@@ -54,27 +59,38 @@ export const App: React.FC = () => {
     setCacheNotice(null);
 
     try {
-      // 1. Wipe extension-origin IndexedDB + broadcast invalidation epoch to all open & future tabs (YouTube/Udemy)
-      await clearAllVideoManifests();
+      const [, builtinCleared] = await Promise.all([
+        clearAllVideoManifests(),
+        clearAllBuiltinAudioCache(),
+      ]);
       const next = await saveSettings({ cacheInvalidatedAtMs: Date.now() });
       setSettings(next);
 
-      // 2. Wipe local disk TTS WAV + metadata cache if Local TTS service is online
-      const client = new LocalTtsClient(next.localTtsUrl, next.localTtsToken);
-      try {
-        const diskRes = await client.clearDiskCache();
-        setCacheNotice(
-          `Đã xóa sạch ${diskRes.deletedCount} file voice (${formatBytesToMb(diskRes.freedBytes)}) & toàn bộ cache bản dịch.`,
-        );
-      } catch {
-        setCacheNotice(
-          'Đã xóa toàn bộ cache bản dịch trên trình duyệt (khởi động lại Local TTS nếu muốn dọn thêm file .wav trên ổ đĩa).',
-        );
+      let totalDeletedFiles = builtinCleared.deletedCount;
+      let totalFreedBytes = builtinCleared.freedBytes;
+
+      if (serverOnline) {
+        const client = new LocalTtsClient(next.localTtsUrl, next.localTtsToken);
+        try {
+          const diskRes = await client.clearDiskCache();
+          totalDeletedFiles += diskRes.deletedCount;
+          totalFreedBytes += diskRes.freedBytes;
+        } catch {
+          // Ignore if local server was turned off
+        }
       }
+
+      setCacheNotice(
+        totalDeletedFiles > 0
+          ? `Đã xóa sạch ${totalDeletedFiles} file voice (${formatBytesToMb(totalFreedBytes)}) & toàn bộ cache bản dịch trên mọi tab.`
+          : 'Đã làm sạch toàn bộ cache bản dịch & giọng đọc trên mọi tab trình duyệt.',
+      );
     } finally {
       setClearingCache(false);
     }
   };
+
+  const usingBuiltinMode = settings.engineId === BUILTIN_CLOUD_ENGINE_ID || serverOnline === false;
 
   return (
     <div
@@ -121,16 +137,16 @@ export const App: React.FC = () => {
           borderRadius: '8px',
           marginBottom: '12px',
           fontSize: '12px',
-          background: serverOnline ? 'rgba(16, 185, 129, 0.14)' : 'rgba(245, 158, 11, 0.14)',
-          border: `1px solid ${serverOnline ? 'rgba(16, 185, 129, 0.4)' : 'rgba(245, 158, 11, 0.4)'}`,
-          color: serverOnline ? '#6EE7B7' : '#FCD34D',
+          background: 'rgba(16, 185, 129, 0.14)',
+          border: '1px solid rgba(16, 185, 129, 0.4)',
+          color: '#6EE7B7',
         }}
       >
-        {serverOnline === null
-          ? 'Đang kiểm tra kết nối Local TTS (127.0.0.1:8765)...'
-          : serverOnline
-            ? `Local TTS Sẵn sàng (${voices.length} giọng khả dụng)`
-            : 'Local TTS chưa chạy — Sẽ tự động hiển thị Phụ đề tiếng Việt'}
+        {usingBuiltinMode
+          ? serverOnline
+            ? 'Đang chạy Giọng đọc Tích hợp sẵn (Độc lập 100% · Có thể đổi sang VieNeu Local bên dưới)'
+            : 'Chế độ Độc lập trên Chrome — Không cần bật Python (0 MB Python RAM)'
+          : `Đang dùng Local TTS VieNeu (${voices.length} giọng khả dụng)`}
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
@@ -138,10 +154,14 @@ export const App: React.FC = () => {
           <label
             style={{ display: 'block', marginBottom: '4px', color: '#CBD5E1', fontWeight: 600 }}
           >
-            Giọng đọc & Chế độ Phần cứng
+            Nguồn Giọng đọc Tiếng Việt
           </label>
           <select
-            value={`${settings.engineId}::${settings.voiceId}::${settings.sampleRate}`}
+            value={
+              usingBuiltinMode && settings.engineId !== BUILTIN_CLOUD_ENGINE_ID
+                ? `${BUILTIN_CLOUD_ENGINE_ID}::${BUILTIN_CLOUD_VOICE_ID}::24000`
+                : `${settings.engineId}::${settings.voiceId}::${settings.sampleRate}`
+            }
             onChange={(e) => {
               const [engineId, voiceId, sr] = e.target.value.split('::');
               if (engineId && voiceId) {
@@ -157,25 +177,18 @@ export const App: React.FC = () => {
               border: '1px solid #334155',
             }}
           >
-            {voices.length > 0 ? (
+            <option value={`${BUILTIN_CLOUD_ENGINE_ID}::${BUILTIN_CLOUD_VOICE_ID}::24000`}>
+              Giọng Tiếng Việt Tích hợp sẵn (Mặc định · Không cần Python)
+            </option>
+            {serverOnline &&
               voices.map((v) => (
                 <option
                   key={`${v.engineId}-${v.voiceId}`}
                   value={`${v.engineId}::${v.voiceId}::${v.sampleRate}`}
                 >
-                  {v.displayName}
+                  {v.displayName} (Local)
                 </option>
-              ))
-            ) : (
-              <>
-                <option value="vieneu-onnx::Hải Đăng::48000">
-                  VieNeu v3 Turbo - Hải Đăng (48kHz · Chuẩn Anh-Việt)
-                </option>
-                <option value="vieneu-nano::Hải Đăng::24000">
-                  VieNeu Nano - Hải Đăng (CPU Eco · Máy yếu)
-                </option>
-              </>
-            )}
+              ))}
           </select>
         </div>
 

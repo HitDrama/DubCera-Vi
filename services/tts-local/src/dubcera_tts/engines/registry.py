@@ -46,3 +46,10 @@ class EngineRegistry:
     async def synthesize(self, engine_id: str, text: str, voice_id: str, sample_rate: int) -> SynthesisOutput:
         engine = self.resolve_engine(engine_id)
         return await engine.synthesize(text=text, voice_id=voice_id, sample_rate=sample_rate)
+
+    async def unload_idle_models(self, max_idle_seconds: float = 60.0) -> int:
+        unloaded = 0
+        for eng in self._engines.values():
+            if await eng.unload_if_idle(max_idle_seconds):
+                unloaded += 1
+        return unloaded

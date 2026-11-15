@@ -61,6 +61,21 @@ export class LocalTtsClient {
     }
   }
 
+  public releaseServerMemory(): void {
+    if (isContentScriptContext()) {
+      void sendBackgroundRpc({
+        type: 'TTS_RELEASE_MEMORY',
+        baseUrl: this.baseUrl,
+        token: this.authToken,
+      }).catch(() => {});
+      return;
+    }
+    void fetch(`${this.baseUrl}/v1/memory/release`, {
+      method: 'POST',
+      headers: { 'X-DubCera-Token': this.authToken },
+    }).catch(() => {});
+  }
+
   public updateCredentials(baseUrl: string, authToken: string): void {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.authToken = authToken;

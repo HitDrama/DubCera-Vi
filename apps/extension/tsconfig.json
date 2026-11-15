@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": [
+    ".wxt/wxt.d.ts",
+    "entrypoints/**/*",
+    "src/**/*",
+    "wxt.config.ts"
+  ]
+}

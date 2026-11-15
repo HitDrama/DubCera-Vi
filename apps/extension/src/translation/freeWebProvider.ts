@@ -1,47 +1,11 @@
 import {
-  DEFAULT_TECH_GLOSSARY,
-  type GlossaryEntry,
+  cleanSourceForTranslation,
+  polishTranslatedVietnamese,
   type TranslationBatchRequest,
   type TranslationBatchResultItem,
   type TranslationProvider,
 } from '@dubcera/core';
 import { isContentScriptContext, sendBackgroundRpc } from '../bridges/extensionRpc';
-
-function maskGlossaryTerms(
-  text: string,
-  glossary: ReadonlyArray<GlossaryEntry>,
-): { masked: string; tokens: Array<{ placeholder: string; term: string }> } {
-  const tokens: Array<{ placeholder: string; term: string }> = [];
-  let masked = text;
-
-  const sortedTerms = [...glossary]
-    .filter((g) => g.preserveExact)
-    .sort((a, b) => b.term.length - a.term.length);
-
-  for (const entry of sortedTerms) {
-    const escaped = entry.term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`\\b${escaped}\\b`, 'gi');
-    if (regex.test(masked)) {
-      const placeholder = `__DC_TERM_${tokens.length}__`;
-      tokens.push({ placeholder, term: entry.term });
-      masked = masked.replace(regex, placeholder);
-    }
-  }
-
-  return { masked, tokens };
-}
-
-function unmaskGlossaryTerms(
-  translated: string,
-  tokens: ReadonlyArray<{ placeholder: string; term: string }>,
-): string {
-  let out = translated;
-  for (const t of tokens) {
-    const flexRegex = new RegExp(t.placeholder.replace(/_/g, '[_\\s]*'), 'gi');
-    out = out.replace(flexRegex, t.term);
-  }
-  return out.replace(/\s+/g, ' ').trim();
-}
 
 export class FreeWebTranslationProvider implements TranslationProvider {
   public readonly providerId = 'free-web';
@@ -54,10 +18,11 @@ export class FreeWebTranslationProvider implements TranslationProvider {
     targetLang: string,
     signal?: AbortSignal,
   ): Promise<string> {
+    const effectiveSource = !sourceLang || sourceLang === 'en' ? 'auto' : sourceLang;
     if (isContentScriptContext()) {
       return sendBackgroundRpc<string>({
         type: 'FREE_WEB_TRANSLATE',
-        sourceLang: sourceLang || 'auto',
+        sourceLang: effectiveSource,
         targetLang: targetLang || 'vi',
         query,
         sessionTag: this.sessionTag,
@@ -66,7 +31,7 @@ export class FreeWebTranslationProvider implements TranslationProvider {
 
     const url = new URL('https://translate.googleapis.com/translate_a/single');
     url.searchParams.set('client', 'gtx');
-    url.searchParams.set('sl', sourceLang || 'auto');
+    url.searchParams.set('sl', effectiveSource);
     url.searchParams.set('tl', targetLang || 'vi');
     url.searchParams.set('dt', 't');
     url.searchParams.set('q', query);
@@ -87,54 +52,74 @@ export class FreeWebTranslationProvider implements TranslationProvider {
     request: TranslationBatchRequest,
     signal?: AbortSignal,
   ): Promise<TranslationBatchResultItem[]> {
-    const glossary = request.glossary ?? DEFAULT_TECH_GLOSSARY;
-    const results: TranslationBatchResultItem[] = [];
+    if (request.items.length === 0) return [];
 
-    const maskedEntries = request.items.map((item) => ({
+    const preparedItems = request.items.map((item) => ({
       segmentId: item.segmentId,
-      ...maskGlossaryTerms(item.sourceText, glossary),
+      rawSource: item.sourceText,
+      cleanedSource: cleanSourceForTranslation(item.sourceText) || item.sourceText,
     }));
 
-    const joinedPayload = maskedEntries
-      .map((entry, idx) => `[#${idx}#] ${entry.masked}`)
-      .join('\n');
+    // Include up to 2 preceding sentences so neural translation resolves pronouns & topic context
+    const priorContext = request.contextBefore
+      .slice(-2)
+      .map((c) => cleanSourceForTranslation(c))
+      .filter((c) => c.length > 0);
+
+    const payloadLines: string[] = [];
+    priorContext.forEach((ctxLine, cIdx) => {
+      payloadLines.push(`(0.${cIdx + 1}) ${ctxLine}`);
+    });
+    preparedItems.forEach((entry, idx) => {
+      payloadLines.push(`(${idx + 1}) ${entry.cleanedSource}`);
+    });
 
     const combinedTranslated = await this.runTranslateQuery(
-      joinedPayload,
+      payloadLines.join('\n'),
       request.sourceLang,
       request.targetLang,
       signal,
     );
 
     const splitMap = new Map<number, string>();
-    const markerRegex = /\[#\s*(\d+)\s*#\]/g;
+    const markerRegex = /[（(]\s*(\d+(?:\.\d+)?)\s*[)）]/g;
     const matches = Array.from(combinedTranslated.matchAll(markerRegex));
 
     for (let m = 0; m < matches.length; m++) {
       const currentMatch = matches[m]!;
-      const idx = Number(currentMatch[1]);
+      const label = currentMatch[1]!;
+      if (label.includes('.')) {
+        // Context-only line (0.1, 0.2) — discard from output
+        continue;
+      }
+      const idx = Number(label) - 1;
       const sliceStart = (currentMatch.index ?? 0) + currentMatch[0].length;
       const sliceEnd =
         m + 1 < matches.length
           ? (matches[m + 1]!.index ?? combinedTranslated.length)
           : combinedTranslated.length;
-      splitMap.set(idx, combinedTranslated.slice(sliceStart, sliceEnd).trim());
+      const extracted = combinedTranslated.slice(sliceStart, sliceEnd).trim();
+      if (idx >= 0 && extracted) {
+        splitMap.set(idx, extracted);
+      }
     }
 
-    for (let i = 0; i < maskedEntries.length; i++) {
-      const entry = maskedEntries[i]!;
+    const results: TranslationBatchResultItem[] = [];
+    for (let i = 0; i < preparedItems.length; i++) {
+      const entry = preparedItems[i]!;
       let rawTranslated = splitMap.get(i);
       if (!rawTranslated) {
         rawTranslated = await this.runTranslateQuery(
-          entry.masked,
+          entry.cleanedSource,
           request.sourceLang,
           request.targetLang,
           signal,
         );
       }
+
       results.push({
         segmentId: entry.segmentId,
-        translatedText: unmaskGlossaryTerms(rawTranslated, entry.tokens),
+        translatedText: polishTranslatedVietnamese(rawTranslated, entry.rawSource),
       });
     }
 

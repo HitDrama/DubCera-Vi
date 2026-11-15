@@ -31,6 +31,8 @@ export default defineContentScript({
       if (!urlStr.includes('/api/timedtext') || bodyText.trim().length < 20) return;
       try {
         const u = new URL(urlStr, location.origin);
+        // Ignore YouTube's degraded cue-by-cue auto-translated captions (`tlang=`) so DubCera always gets clean source text
+        if (u.searchParams.has('tlang')) return;
         const vid = u.searchParams.get('v');
         if (vid) {
           interceptedPayloadsByVideoId.set(vid, bodyText);

@@ -1,3 +1,4 @@
+import { toSpokenVietnameseTtsText } from '@dubcera/core';
 import {
   base64ToAudioBytes,
   isContentScriptContext,
@@ -8,6 +9,8 @@ import {
   putBuiltinCachedAudio,
   verifyBuiltinCachedAudioKeys,
 } from '../storage/builtinAudioCacheDb';
+import { trimAndMergeMp3Chunks } from './mp3SilenceTrimmer';
+import type { BuiltinVoiceVariantId } from './voiceTimbreProcessor';
 
 export const BUILTIN_CLOUD_ENGINE_ID = 'builtin-cloud-vi';
 export const BUILTIN_CLOUD_VOICE_ID = 'vi-standard';
@@ -18,7 +21,7 @@ export interface BuiltinSynthResponse {
   cacheHit: boolean;
 }
 
-function splitClausesLocal(rawText: string, maxChars = 175): string[] {
+function splitClausesLocal(rawText: string, maxChars = 180): string[] {
   const cleaned = rawText.replace(/\s+/g, ' ').trim();
   if (!cleaned) return [];
   if (cleaned.length <= maxChars) return [cleaned];
@@ -45,8 +48,8 @@ function splitClausesLocal(rawText: string, maxChars = 175): string[] {
 }
 
 /**
- * Pure-Extension Zero-Install Vietnamese TTS Client (Cách 1).
- * Runs 100% inside the Chrome Extension with 0 MB Python RAM and no external software required.
+ * Pure-Extension Zero-Server Multi-Voice Vietnamese TTS Client.
+ * Supports Female & Male voices directly inside Chrome (0 MB Python RAM, no server needed).
  */
 export class BuiltinCloudTtsClient {
   constructor(private readonly sessionTag?: string) {}
@@ -80,6 +83,7 @@ export class BuiltinCloudTtsClient {
   public async synthesizeAndCache(params: {
     audioCacheKey: string;
     text: string;
+    voiceVariant?: BuiltinVoiceVariantId;
     minValidTimestampMs?: number;
     signal?: AbortSignal;
   }): Promise<BuiltinSynthResponse> {
@@ -94,52 +98,42 @@ export class BuiltinCloudTtsClient {
       };
     }
 
-    let bytes: Uint8Array;
-    let mimeType = 'audio/mpeg';
-    let audioDurationMs: number;
+    const spokenScript = toSpokenVietnameseTtsText(params.text) || params.text;
+    let rawChunks: Uint8Array[] = [];
 
     if (isContentScriptContext()) {
       const res = await sendBackgroundRpc<{
-        audioBase64: string;
+        chunksBase64: string[];
         mimeType: string;
-        audioDurationMs: number;
+        rawDurationMs: number;
       }>({
         type: 'BUILTIN_TTS_SYNTHESIZE',
-        text: params.text,
+        text: spokenScript,
         targetLang: 'vi',
         sessionTag: this.sessionTag,
       });
-      bytes = base64ToAudioBytes(res.audioBase64);
-      mimeType = res.mimeType || 'audio/mpeg';
-      audioDurationMs = res.audioDurationMs;
+      rawChunks = res.chunksBase64.map((b64) => base64ToAudioBytes(b64));
     } else {
-      const chunks = splitClausesLocal(params.text, 175);
-      const parts: Uint8Array[] = [];
-      let total = 0;
-      for (const piece of chunks) {
+      const pieces = splitClausesLocal(spokenScript, 180);
+      for (const piece of pieces) {
         const url = new URL('https://translate.googleapis.com/translate_tts');
         url.searchParams.set('ie', 'UTF-8');
         url.searchParams.set('client', 'gtx');
         url.searchParams.set('tl', 'vi');
+        url.searchParams.set('ttsspeed', '1');
         url.searchParams.set('q', piece);
         const resp = await fetch(url.toString(), { method: 'GET', signal: params.signal });
         if (!resp.ok) throw new Error(`Built-in TTS HTTP ${resp.status}`);
-        const buf = new Uint8Array(await resp.arrayBuffer());
-        parts.push(buf);
-        total += buf.byteLength;
+        rawChunks.push(new Uint8Array(await resp.arrayBuffer()));
       }
-      bytes = new Uint8Array(total);
-      let offset = 0;
-      for (const p of parts) {
-        bytes.set(p, offset);
-        offset += p.byteLength;
-      }
-      audioDurationMs = Math.max(250, Math.round(total / 8));
     }
 
-    const arrayBuf = bytes.buffer.slice(
-      bytes.byteOffset,
-      bytes.byteOffset + bytes.byteLength,
+    const variant: BuiltinVoiceVariantId = params.voiceVariant ?? 'vi-standard';
+    const { audioBytes, mimeType, audioDurationMs } = await trimAndMergeMp3Chunks(rawChunks, variant);
+
+    const arrayBuf = audioBytes.buffer.slice(
+      audioBytes.byteOffset,
+      audioBytes.byteOffset + audioBytes.byteLength,
     ) as ArrayBuffer;
 
     await putBuiltinCachedAudio({

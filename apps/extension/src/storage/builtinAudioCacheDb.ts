@@ -9,6 +9,9 @@ const AUDIO_STORE_NAME = 'audio_clips';
 export const BUILTIN_AUDIO_TTL_MS = 24 * 60 * 60 * 1000;
 export const BUILTIN_AUDIO_MAX_BYTES = 500 * 1024 * 1024;
 
+let lastAudioPruneCheckMs = 0;
+const PRUNE_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+
 export interface StoredBuiltinAudioRecord {
   audioCacheKey: string;
   mimeType: string;
@@ -122,16 +125,42 @@ export async function verifyBuiltinCachedAudioKeys(
   minValidTimestampMs = 0,
 ): Promise<Record<string, { audioDurationMs: number }>> {
   if (cacheKeys.length === 0) return {};
-  await pruneBuiltinAudioCache(minValidTimestampMs);
-
-  const validMap: Record<string, { audioDurationMs: number }> = {};
-  for (const key of cacheKeys) {
-    const rec = await getBuiltinCachedAudio(key, minValidTimestampMs);
-    if (rec) {
-      validMap[key.toLowerCase()] = { audioDurationMs: rec.audioDurationMs };
-    }
+  const nowMs = Date.now();
+  if (nowMs - lastAudioPruneCheckMs >= PRUNE_CHECK_INTERVAL_MS) {
+    lastAudioPruneCheckMs = nowMs;
+    await pruneBuiltinAudioCache(minValidTimestampMs);
   }
-  return validMap;
+
+  try {
+    const db = await openAudioDatabase();
+    return await new Promise<Record<string, { audioDurationMs: number }>>((resolve) => {
+      const validMap: Record<string, { audioDurationMs: number }> = {};
+      const tx = db.transaction(AUDIO_STORE_NAME, 'readonly');
+      const store = tx.objectStore(AUDIO_STORE_NAME);
+
+      for (const rawKey of cacheKeys) {
+        const cleanKey = rawKey.toLowerCase();
+        const req = store.get(cleanKey);
+        req.onsuccess = () => {
+          const rec = (req.result as StoredBuiltinAudioRecord | undefined) ?? null;
+          if (
+            rec &&
+            nowMs - rec.createdAtMs < BUILTIN_AUDIO_TTL_MS &&
+            rec.createdAtMs >= minValidTimestampMs &&
+            rec.audioBytes &&
+            rec.audioBytes.byteLength >= 64
+          ) {
+            validMap[cleanKey] = { audioDurationMs: rec.audioDurationMs };
+          }
+        };
+      }
+
+      tx.oncomplete = () => resolve(validMap);
+      tx.onerror = () => resolve(validMap);
+    });
+  } catch {
+    return {};
+  }
 }
 
 export async function putBuiltinCachedAudio(params: {
@@ -143,6 +172,7 @@ export async function putBuiltinCachedAudio(params: {
   try {
     const db = await openAudioDatabase();
     const cleanKey = params.audioCacheKey.toLowerCase();
+    const nowMs = Date.now();
     await new Promise<void>((resolve) => {
       const tx = db.transaction(AUDIO_STORE_NAME, 'readwrite');
       const store = tx.objectStore(AUDIO_STORE_NAME);
@@ -151,14 +181,17 @@ export async function putBuiltinCachedAudio(params: {
         mimeType: params.mimeType,
         audioDurationMs: params.audioDurationMs,
         sizeBytes: params.audioBytes.byteLength,
-        createdAtMs: Date.now(),
+        createdAtMs: nowMs,
         audioBytes: params.audioBytes,
       };
       store.put(record);
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
     });
-    await pruneBuiltinAudioCache();
+    if (nowMs - lastAudioPruneCheckMs >= PRUNE_CHECK_INTERVAL_MS) {
+      lastAudioPruneCheckMs = nowMs;
+      void pruneBuiltinAudioCache();
+    }
   } catch {
     // Best-effort cache write
   }

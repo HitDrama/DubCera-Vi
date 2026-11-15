@@ -1,4 +1,8 @@
-import type { DubCeraRpcRequest, DubCeraRpcResponse } from '../src/bridges/extensionRpc';
+import type {
+  DubCeraRpcRequest,
+  DubCeraRpcResponse,
+  StructuredTranslatedSentence,
+} from '../src/bridges/extensionRpc';
 
 const activeSessionControllers = new Map<string, Set<AbortController>>();
 
@@ -52,7 +56,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(chunks.join(''));
 }
 
-function splitTextForBuiltinTts(rawText: string, maxChars = 175): string[] {
+function splitTextForBuiltinTts(rawText: string, maxChars = 180): string[] {
   const cleaned = rawText.replace(/\s+/g, ' ').trim();
   if (!cleaned) return [];
   if (cleaned.length <= maxChars) return [cleaned];
@@ -89,6 +93,102 @@ function splitTextForBuiltinTts(rawText: string, maxChars = 175): string[] {
     chunks.push(remaining);
   }
   return chunks;
+}
+
+async function handleAiLlmTranslate(
+  msg: Extract<DubCeraRpcRequest, { type: 'AI_LLM_TRANSLATE' }>,
+  signal: AbortSignal,
+): Promise<string> {
+  const apiKey = msg.apiKey.trim();
+  if (!apiKey) {
+    throw new Error('Missing AI API key');
+  }
+
+  if (msg.provider === 'gemini') {
+    const modelName = (msg.model || 'gemini-2.5-flash').replace(/^models\//, '');
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+    const resp = await fetch(geminiUrl, {
+      method: 'POST',
+      signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: msg.systemPrompt }],
+        },
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: msg.userPayload }],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.2,
+          responseMimeType: 'application/json',
+        },
+      }),
+    });
+
+    if (!resp.ok) {
+      const detail = await resp.text().catch(() => '');
+      throw new Error(`Gemini HTTP ${resp.status}: ${detail.slice(0, 180)}`);
+    }
+
+    const body = (await resp.json()) as {
+      candidates?: Array<{
+        content?: { parts?: Array<{ text?: string }> };
+      }>;
+    };
+    const rawText =
+      body.candidates?.[0]?.content?.parts
+        ?.map((p) => p.text ?? '')
+        .join('')
+        .trim() ?? '';
+
+    if (!rawText) {
+      throw new Error('Gemini returned empty content');
+    }
+    return rawText;
+  }
+
+  const endpoint =
+    msg.provider === 'groq'
+      ? 'https://api.groq.com/openai/v1/chat/completions'
+      : msg.endpointUrl.trim() || 'https://api.openai.com/v1/chat/completions';
+
+  const defaultModel = msg.provider === 'groq' ? 'llama-3.3-70b-versatile' : 'gpt-4o-mini';
+
+  const resp = await fetch(endpoint, {
+    method: 'POST',
+    signal,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: msg.model.trim() || defaultModel,
+      temperature: 0.2,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: msg.systemPrompt },
+        { role: 'user', content: msg.userPayload },
+      ],
+    }),
+  });
+
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => '');
+    throw new Error(`LLM HTTP ${resp.status}: ${detail.slice(0, 180)}`);
+  }
+
+  const body = (await resp.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const rawContent = body.choices?.[0]?.message?.content?.trim() ?? '';
+  if (!rawContent) {
+    throw new Error('LLM returned empty content');
+  }
+  return rawContent;
 }
 
 async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
@@ -197,12 +297,12 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
     case 'BUILTIN_TTS_SYNTHESIZE': {
       const { controller, cleanup } = registerSessionController(msg.sessionTag);
       try {
-        const chunks = splitTextForBuiltinTts(msg.text, 175);
+        const chunks = splitTextForBuiltinTts(msg.text, 180);
         if (chunks.length === 0) {
           throw new Error('Empty TTS text');
         }
 
-        const mp3Buffers: Uint8Array[] = [];
+        const chunksBase64: string[] = [];
         let totalLength = 0;
 
         for (const piece of chunks) {
@@ -210,6 +310,7 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
           url.searchParams.set('ie', 'UTF-8');
           url.searchParams.set('client', 'gtx');
           url.searchParams.set('tl', msg.targetLang || 'vi');
+          url.searchParams.set('ttsspeed', '1');
           url.searchParams.set('q', piece);
 
           const resp = await fetch(url.toString(), {
@@ -219,24 +320,15 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
           if (!resp.ok) {
             throw new Error(`Built-in TTS HTTP ${resp.status}`);
           }
-          const arr = new Uint8Array(await resp.arrayBuffer());
-          mp3Buffers.push(arr);
-          totalLength += arr.byteLength;
+          const buf = await resp.arrayBuffer();
+          totalLength += buf.byteLength;
+          chunksBase64.push(arrayBufferToBase64(buf));
         }
 
-        const merged = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const arr of mp3Buffers) {
-          merged.set(arr, offset);
-          offset += arr.byteLength;
-        }
-
-        // 64 kbps CBR MPEG-2 Layer III = 8,000 bytes/sec = 8 bytes/ms
-        const audioDurationMs = Math.max(250, Math.round(totalLength / 8));
         return {
-          audioBase64: arrayBufferToBase64(merged.buffer),
+          chunksBase64,
           mimeType: 'audio/mpeg',
-          audioDurationMs,
+          rawDurationMs: Math.max(250, Math.round(totalLength / 8)),
         };
       } finally {
         cleanup();
@@ -251,6 +343,9 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
         url.searchParams.set('sl', msg.sourceLang || 'auto');
         url.searchParams.set('tl', msg.targetLang || 'vi');
         url.searchParams.set('dt', 't');
+        if (msg.structured) {
+          url.searchParams.set('dj', '1');
+        }
         url.searchParams.set('q', msg.query);
 
         const resp = await fetch(url.toString(), {
@@ -258,11 +353,34 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
           signal: controller.signal,
         });
         if (!resp.ok) throw new Error(`Translate HTTP ${resp.status}`);
+
+        if (msg.structured) {
+          const djJson = (await resp.json()) as {
+            sentences?: Array<{ orig?: string; trans?: string }>;
+          };
+          const out: StructuredTranslatedSentence[] = [];
+          for (const s of djJson.sentences ?? []) {
+            if (typeof s.trans === 'string') {
+              out.push({ orig: s.orig ?? '', trans: s.trans });
+            }
+          }
+          return out;
+        }
+
         const rawJson = (await resp.json()) as unknown;
         const parts = Array.isArray(rawJson) && Array.isArray(rawJson[0]) ? (rawJson[0] as unknown[]) : [];
         return parts
           .map((p) => (Array.isArray(p) && typeof p[0] === 'string' ? p[0] : ''))
           .join('');
+      } finally {
+        cleanup();
+      }
+    }
+
+    case 'AI_LLM_TRANSLATE': {
+      const { controller, cleanup } = registerSessionController(msg.sessionTag);
+      try {
+        return await handleAiLlmTranslate(msg, controller.signal);
       } finally {
         cleanup();
       }

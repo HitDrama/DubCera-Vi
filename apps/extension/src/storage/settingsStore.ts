@@ -5,6 +5,8 @@ import type {
   SynthesisConfigSnapshot,
 } from '@dubcera/core';
 
+export type TranslationProviderKind = 'free-web' | 'gemini' | 'groq' | 'openai-compatible';
+
 export interface DubCeraSettings {
   enabled: boolean;
   localTtsUrl: string;
@@ -18,7 +20,7 @@ export interface DubCeraSettings {
   minEffectiveSpeechRate: number;
   maxEffectiveSpeechRate: number;
   originalVideoVolumeRatio: number; // e.g. 0.12 (12% background ducked volume)
-  translationProvider: 'free-web' | 'openai-compatible';
+  translationProvider: TranslationProviderKind;
   llmEndpointUrl: string;
   llmApiKey: string;
   llmModel: string;
@@ -41,11 +43,25 @@ export const DEFAULT_SETTINGS: DubCeraSettings = {
   translationProvider: 'free-web',
   llmEndpointUrl: 'https://api.openai.com/v1/chat/completions',
   llmApiKey: '',
-  llmModel: 'gpt-4o-mini',
+  llmModel: 'gemini-2.5-flash',
   cacheInvalidatedAtMs: 0,
 };
 
 const STORAGE_KEY = 'dubcera_settings_v1';
+
+function normalizeMigratedVoiceSettings(merged: DubCeraSettings): DubCeraSettings {
+  merged.minEffectiveSpeechRate = Math.max(1.0, merged.minEffectiveSpeechRate || 1.0);
+  if (merged.engineId === 'edge-hybrid') {
+    const wasFemale = merged.voiceId.toLowerCase().includes('hoaimy');
+    merged.engineId = 'vieneu-nano';
+    merged.voiceId = wasFemale ? 'Trúc Ly' : 'Minh Quân';
+    merged.sampleRate = 24000;
+  } else if (merged.engineId === 'vieneu-nano' && merged.voiceId === 'Hải Đăng') {
+    merged.voiceId = 'Minh Quân';
+    merged.sampleRate = 24000;
+  }
+  return merged;
+}
 
 export async function loadSettings(): Promise<DubCeraSettings> {
   try {
@@ -53,16 +69,13 @@ export async function loadSettings(): Promise<DubCeraSettings> {
       const data = await chrome.storage.local.get(STORAGE_KEY);
       if (data && data[STORAGE_KEY]) {
         const merged = { ...DEFAULT_SETTINGS, ...(data[STORAGE_KEY] as Partial<DubCeraSettings>) };
-        // Guarantee baseline voice speed never drops below 1.0x even if an older 0.8x value was saved
-        merged.minEffectiveSpeechRate = Math.max(1.0, merged.minEffectiveSpeechRate || 1.0);
-        return merged;
+        return normalizeMigratedVoiceSettings(merged);
       }
     } else if (typeof localStorage !== 'undefined') {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const merged = { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<DubCeraSettings>) };
-        merged.minEffectiveSpeechRate = Math.max(1.0, merged.minEffectiveSpeechRate || 1.0);
-        return merged;
+        return normalizeMigratedVoiceSettings(merged);
       }
     }
   } catch {
@@ -91,7 +104,7 @@ export function toSynthesisConfigSnapshot(settings: DubCeraSettings): SynthesisC
     targetLang: 'vi',
     voiceId: settings.voiceId,
     engineId: settings.engineId,
-    modelVersion: 'v1',
+    modelVersion: 'v3-multivoice-wsola',
     sampleRate: settings.sampleRate,
     styleOrPitchConfig: 'default',
     pauseConfig: 'default',

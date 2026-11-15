@@ -4,6 +4,11 @@ import type {
   VerifiedCacheEntry,
 } from '../tts/localTtsClient';
 
+export interface StructuredTranslatedSentence {
+  orig: string;
+  trans: string;
+}
+
 export type DubCeraRpcRequest =
   | { type: 'TTS_HEALTH'; baseUrl: string; token: string; timeoutMs?: number }
   | { type: 'TTS_VERIFY_CACHE'; baseUrl: string; token: string; cacheKeys: string[] }
@@ -36,6 +41,17 @@ export type DubCeraRpcRequest =
       sourceLang: string;
       targetLang: string;
       query: string;
+      structured?: boolean;
+      sessionTag?: string;
+    }
+  | {
+      type: 'AI_LLM_TRANSLATE';
+      provider: 'gemini' | 'groq' | 'openai-compatible';
+      endpointUrl: string;
+      apiKey: string;
+      model: string;
+      systemPrompt: string;
+      userPayload: string;
       sessionTag?: string;
     }
   | { type: 'FETCH_SUBTITLE_TEXT'; url: string }

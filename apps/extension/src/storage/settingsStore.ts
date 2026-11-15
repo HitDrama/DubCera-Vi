@@ -33,7 +33,7 @@ export const DEFAULT_SETTINGS: DubCeraSettings = {
   hardwareProfile: 'AUTO',
   syncMode: 'LEARNING_HOLD_VIDEO',
   subtitleMode: 'BILINGUAL',
-  maxEffectiveSpeechRate: 1.3,
+  maxEffectiveSpeechRate: 1.2,
   originalVideoVolumeRatio: 0.12,
   translationProvider: 'free-web',
   llmEndpointUrl: 'https://api.openai.com/v1/chat/completions',

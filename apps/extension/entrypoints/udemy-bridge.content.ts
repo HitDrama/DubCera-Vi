@@ -26,6 +26,17 @@ export default defineContentScript({
       return m?.[1] ?? null;
     }
 
+    function isLikelySubtitleVttUrl(url: string): boolean {
+      return !/(?:sprite|thumb|storyboard|chapter)/i.test(url);
+    }
+
+    function isSpokenVttPayload(vttText: string): boolean {
+      const trimmed = vttText.trimStart();
+      if (!trimmed.startsWith('WEBVTT') || trimmed.length < 20) return false;
+      if (/#xywh=\d+,\d+,\d+,\d+/i.test(trimmed)) return false;
+      return true;
+    }
+
     function parseCaptionArray(rawArr: unknown[]): UdemyCaptionTrack[] {
       const out: UdemyCaptionTrack[] = [];
       for (const item of rawArr) {
@@ -38,6 +49,7 @@ export default defineContentScript({
               ? rec.src
               : '';
         if (!url || (!url.includes('.vtt') && !url.startsWith('http'))) continue;
+        if (!isLikelySubtitleVttUrl(url)) continue;
 
         let localeId = '';
         if (typeof rec.locale_id === 'string') {
@@ -120,8 +132,8 @@ export default defineContentScript({
       return lectureMatch?.[1];
     }
 
-    function recordVttPayload(vttText: string): void {
-      if (!vttText.trimStart().startsWith('WEBVTT') || vttText.trim().length < 20) return;
+    function recordVttPayload(urlStr: string, vttText: string): void {
+      if (!isLikelySubtitleVttUrl(urlStr) || !isSpokenVttPayload(vttText)) return;
       const vid = resolveCurrentLectureId();
       vttTextByLectureId.set(vid, vttText);
       window.dispatchEvent(
@@ -150,11 +162,11 @@ export default defineContentScript({
 
         if (resp.ok) {
           const contentType = (resp.headers.get('content-type') ?? '').toLowerCase();
-          if (urlStr.includes('.vtt') || contentType.includes('text/vtt')) {
+          if ((urlStr.includes('.vtt') || contentType.includes('text/vtt')) && isLikelySubtitleVttUrl(urlStr)) {
             void resp
               .clone()
               .text()
-              .then((txt) => recordVttPayload(txt))
+              .then((txt) => recordVttPayload(urlStr, txt))
               .catch(() => {});
           } else if (urlStr.includes('/api-2.0/')) {
             const lectureHint = recordApiUrlMetadata(urlStr);
@@ -199,7 +211,7 @@ export default defineContentScript({
             if (this.responseType === '' || this.responseType === 'text') {
               const txt = this.responseText;
               if (urlStr.includes('.vtt') || txt.trimStart().startsWith('WEBVTT')) {
-                recordVttPayload(txt);
+                recordVttPayload(urlStr, txt);
               } else if (urlStr.includes('/api-2.0/')) {
                 const lectureHint = recordApiUrlMetadata(urlStr);
                 scanJsonForCaptions(JSON.parse(txt), lectureHint);
@@ -334,12 +346,12 @@ export default defineContentScript({
         }
       }
 
-      // Layer D: Scan PerformanceResourceTiming for any `.vtt` file already loaded by Udemy's player
+      // Layer D: Scan PerformanceResourceTiming for any spoken `.vtt` file already loaded by Udemy's player
       try {
         const resources = performance.getEntriesByType('resource');
         for (let i = resources.length - 1; i >= 0; i--) {
           const resUrl = resources[i]?.name ?? '';
-          if (resUrl.includes('.vtt') && resUrl.startsWith('https://')) {
+          if (resUrl.includes('.vtt') && resUrl.startsWith('https://') && isLikelySubtitleVttUrl(resUrl)) {
             window.dispatchEvent(
               new CustomEvent('dubcera:udemy-captions-result', {
                 detail: { videoId: requestedVideoId, ok: true, vttUrl: resUrl },

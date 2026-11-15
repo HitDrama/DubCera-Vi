@@ -15,6 +15,7 @@ import {
   recordSeekInitiated,
   recordUserPauseIntent,
   recordUserPlayIntent,
+  resolveSeekTargetWithSnap,
   resolveSegmentIndexAtVideoTime,
   selectActiveDisplayChunk,
   sha256Hex,
@@ -30,7 +31,7 @@ import { toSynthesisConfigSnapshot, type DubCeraSettings } from '../storage/sett
 import { FreeWebTranslationProvider } from '../translation/freeWebProvider';
 import { LlmApiTranslationProvider } from '../translation/llmApiProvider';
 import { LocalTtsClient } from '../tts/localTtsClient';
-import { SingleAudioQueue } from './singleAudioQueue';
+import { SingleAudioQueue, type PausedAudioBookmark } from './singleAudioQueue';
 
 export interface CoordinatorUiSnapshot {
   playbackState: PlaybackState;
@@ -42,6 +43,10 @@ export interface CoordinatorUiSnapshot {
   translatedCount: number;
   totalSegments: number;
   segments: ReadonlyArray<SpeechSegment>;
+}
+
+interface StoredPauseBookmark extends PausedAudioBookmark {
+  videoTimeAtPauseMs: number;
 }
 
 export class AdaptiveSyncCoordinator {
@@ -59,14 +64,21 @@ export class AdaptiveSyncCoordinator {
   private readonly audioQueue: SingleAudioQueue;
 
   private seekDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-  private workerLoopRunning = false;
+  private translationLoopRunning = false;
+  private ttsLoopRunning = false;
   private playbackLoopId = 0;
   private prevAudioEndClockMs = 0;
   private originalUserVideoVolume = 1.0;
   private baseUserVideoRate = 1.0;
+
+  private pausedBookmark: StoredPauseBookmark | null = null;
+  private pendingSeekSnapRequired = false;
+  private wasPlayingBeforeScrub = false;
+
   private ignorePauseEventUntilMs = 0;
   private ignorePlayEventUntilMs = 0;
   private ignoreRateChangeUntilMs = 0;
+  private ignoreSeekEventsUntilMs = 0;
 
   private readonly boundHandlers: {
     play: () => void;
@@ -154,12 +166,15 @@ export class AdaptiveSyncCoordinator {
       : `Đã nạp ${this.segments.length} câu thoại`;
     this.emitSnapshot();
 
-    // Kick off background worker pipeline immediately
-    void this.pumpPreparationQueue();
+    // Kick off decoupled parallel Translation + TTS background workers
+    this.triggerBackgroundWorkers();
 
     if (!this.video.paused && this.settings.enabled) {
       this.playbackState = recordUserPlayIntent(this.playbackState);
-      void this.coordinateAtPlayhead(this.video.currentTime * 1000);
+      const alignedMs = this.alignPlayheadToSentenceStart();
+      void this.coordinateAtPlayhead(alignedMs);
+    } else if (this.settings.enabled) {
+      this.updatePreviewChunkAtVideoMs(this.video.currentTime * 1000);
     }
   }
 
@@ -172,8 +187,10 @@ export class AdaptiveSyncCoordinator {
     this.activeConfigVersion = computeConfigVersion(configSnap);
 
     if (!nextSettings.enabled) {
+      this.pausedBookmark = null;
       this.audioQueue.stopImmediate();
       this.video.volume = this.originalUserVideoVolume;
+      this.programmaticSetVideoRate(this.baseUserVideoRate);
       this.activeChunk = null;
       this.bufferingMessage = null;
       this.playbackState = exitDubBuffering(this.playbackState);
@@ -183,7 +200,7 @@ export class AdaptiveSyncCoordinator {
     }
 
     if (prevConfigVer !== this.activeConfigVersion) {
-      // Voice/engine changed: keep all translatedText intact, recompute audioCacheKeys, re-verify disk cache!
+      this.pausedBookmark = null;
       this.playbackState = recordSeekInitiated(this.playbackState);
       this.audioQueue.stopImmediate();
       for (const seg of this.segments) {
@@ -195,9 +212,10 @@ export class AdaptiveSyncCoordinator {
         }
       }
       await this.verifyDiskCacheAndHealth();
-      void this.pumpPreparationQueue();
+      this.triggerBackgroundWorkers();
       if (!this.video.paused) {
-        void this.coordinateAtPlayhead(this.video.currentTime * 1000);
+        const alignedMs = this.alignPlayheadToSentenceStart();
+        void this.coordinateAtPlayhead(alignedMs);
       }
     }
     this.emitSnapshot();
@@ -209,10 +227,12 @@ export class AdaptiveSyncCoordinator {
   public requestExplicitUserPause(): void {
     this.playbackState = recordUserPauseIntent(this.playbackState);
     this.bufferingMessage = null;
-    this.audioQueue.stopImmediate();
+    this.pausedBookmark = null;
+    this.audioQueue.stopImmediate(false);
     if (!this.video.paused) {
       this.programmaticPauseVideo();
     }
+    this.programmaticSetVideoRate(this.baseUserVideoRate);
     this.statusBanner = 'Đã tạm dừng';
     this.emitSnapshot();
   }
@@ -223,7 +243,8 @@ export class AdaptiveSyncCoordinator {
   public async resumeAfterAutoplayBlock(): Promise<void> {
     this.playbackState = recordUserPlayIntent(this.playbackState);
     this.emitSnapshot();
-    await this.coordinateAtPlayhead(this.video.currentTime * 1000);
+    const alignedMs = this.alignPlayheadToSentenceStart();
+    await this.coordinateAtPlayhead(alignedMs);
   }
 
   public dispose(): void {
@@ -253,14 +274,14 @@ export class AdaptiveSyncCoordinator {
 
   private programmaticPauseVideo(): void {
     if (!this.video.paused) {
-      this.ignorePauseEventUntilMs = performance.now() + 250;
+      this.ignorePauseEventUntilMs = performance.now() + 280;
       this.video.pause();
     }
   }
 
   private async programmaticPlayVideo(): Promise<boolean> {
     if (!this.video.paused) return true;
-    this.ignorePlayEventUntilMs = performance.now() + 250;
+    this.ignorePlayEventUntilMs = performance.now() + 280;
     try {
       await this.video.play();
       return true;
@@ -272,6 +293,11 @@ export class AdaptiveSyncCoordinator {
     }
   }
 
+  private programmaticSeekVideo(targetVideoMs: number): void {
+    this.ignoreSeekEventsUntilMs = performance.now() + 420;
+    this.video.currentTime = Math.max(0, targetVideoMs / 1000);
+  }
+
   private programmaticSetVideoRate(rate: number): void {
     const clamped = Math.max(0.5, Math.min(2.0, Number(rate.toFixed(2))));
     if (Math.abs(this.video.playbackRate - clamped) < 0.01) return;
@@ -279,55 +305,170 @@ export class AdaptiveSyncCoordinator {
     this.video.playbackRate = clamped;
   }
 
+  /**
+   * Snaps `video.currentTime` cleanly back to `seg.startMs` when the playhead is sitting
+   * in the middle of a sentence after an explicit seek, guaranteeing both video and voice
+   * play the complete sentence from word 1 at calm ~1.0x speed instead of rushing!
+   */
+  private alignPlayheadToSentenceStart(): number {
+    const rawMs = this.video.currentTime * 1000;
+    this.pendingSeekSnapRequired = false;
+    const { segmentIndex, snapVideoTimeMs } = resolveSeekTargetWithSnap(this.segments, rawMs, 250);
+
+    let effectiveMs = rawMs;
+    if (snapVideoTimeMs !== null && Math.abs(rawMs - snapVideoTimeMs) > 200) {
+      this.programmaticSeekVideo(snapVideoTimeMs);
+      effectiveMs = snapVideoTimeMs;
+    }
+
+    if (segmentIndex >= 0) {
+      this.playbackState = { ...this.playbackState, activeSegmentIndex: segmentIndex };
+      this.updatePreviewChunkForSegment(segmentIndex);
+    }
+
+    return effectiveMs;
+  }
+
+  private updatePreviewChunkForSegment(segmentIndex: number): void {
+    const seg = this.segments[segmentIndex];
+    if (!seg) {
+      this.activeChunk = null;
+      return;
+    }
+    this.activeChunk = seg.displayChunks?.[0] ?? {
+      chunkId: `${seg.segmentId}-preview`,
+      text: seg.translatedText ?? seg.sourceText,
+      sourceExcerpt: seg.translatedText ? seg.sourceText : undefined,
+      weightRatio: 1,
+    };
+  }
+
+  private updatePreviewChunkAtVideoMs(videoMs: number): void {
+    const idx = resolveSegmentIndexAtVideoTime(this.segments, videoMs);
+    if (idx >= 0) {
+      this.playbackState = { ...this.playbackState, activeSegmentIndex: idx };
+      this.updatePreviewChunkForSegment(idx);
+    } else {
+      this.activeChunk = null;
+    }
+    this.emitSnapshot();
+  }
+
   private handleNativePlayEvent(): void {
     if (performance.now() < this.ignorePlayEventUntilMs) return;
     this.playbackState = recordUserPlayIntent(this.playbackState);
     if (!this.settings.enabled) return;
-    void this.coordinateAtPlayhead(this.video.currentTime * 1000);
+
+    // Case 1: User simply paused mid-sentence and pressed Play WITHOUT seeking -> resume exact syllable!
+    if (
+      !this.pendingSeekSnapRequired &&
+      this.pausedBookmark &&
+      Math.abs(this.video.currentTime * 1000 - this.pausedBookmark.videoTimeAtPauseMs) <= 650
+    ) {
+      const resumeBookmark = this.pausedBookmark;
+      this.pausedBookmark = null;
+      void this.coordinateAtPlayhead(this.video.currentTime * 1000, resumeBookmark);
+      return;
+    }
+
+    // Case 2: User pressed Play right after a timeline seek (or initial mid-cue start) -> snap to cue start!
+    this.pausedBookmark = null;
+    if (this.seekDebounceTimer) {
+      clearTimeout(this.seekDebounceTimer);
+      this.seekDebounceTimer = null;
+    }
+    const alignedMs = this.alignPlayheadToSentenceStart();
+    void this.coordinateAtPlayhead(alignedMs);
   }
 
   private handleNativePauseEvent(): void {
     if (performance.now() < this.ignorePauseEventUntilMs) return;
     if (this.video.ended) return;
+
+    this.playbackLoopId += 1;
     this.playbackState = recordUserPauseIntent(this.playbackState);
     this.bufferingMessage = null;
-    this.audioQueue.stopImmediate();
+    this.programmaticSetVideoRate(this.baseUserVideoRate);
+
+    // Preserve exact audio offset + keep current subtitle visible while paused!
+    const captured = this.audioQueue.capturePauseAndStop();
+    if (captured) {
+      this.pausedBookmark = {
+        ...captured,
+        videoTimeAtPauseMs: this.video.currentTime * 1000,
+      };
+      this.statusBanner = `Tạm dừng tại câu ${captured.segmentIndex + 1}/${this.segments.length}`;
+    } else {
+      this.pausedBookmark = null;
+      this.statusBanner = 'Đã tạm dừng';
+    }
     this.emitSnapshot();
   }
 
   private handleNativeSeekingEvent(): void {
+    if (performance.now() < this.ignoreSeekEventsUntilMs) return;
     if (!this.settings.enabled) return;
+
+    if (!this.pendingSeekSnapRequired) {
+      this.wasPlayingBeforeScrub = this.playbackState.intent === 'PLAY' || !this.video.paused;
+    }
+
+    this.pendingSeekSnapRequired = true;
+    this.pausedBookmark = null;
+    this.playbackLoopId += 1;
     this.playbackState = recordSeekInitiated(this.playbackState);
     this.prevAudioEndClockMs = 0;
+    this.bufferingMessage = null;
     this.audioQueue.stopImmediate();
-    this.activeChunk = null;
+    this.programmaticSetVideoRate(this.baseUserVideoRate);
+
     if (this.seekDebounceTimer) {
       clearTimeout(this.seekDebounceTimer);
       this.seekDebounceTimer = null;
+    }
+
+    // Live subtitle preview while dragging timeline so user always sees which sentence they are landing on!
+    const scrubMs = this.video.currentTime * 1000;
+    const previewIdx = resolveSegmentIndexAtVideoTime(this.segments, scrubMs);
+    if (previewIdx >= 0) {
+      this.updatePreviewChunkForSegment(previewIdx);
+      this.statusBanner = `Đang tua tới câu ${previewIdx + 1}/${this.segments.length}`;
+    } else {
+      this.activeChunk = null;
     }
     this.emitSnapshot();
   }
 
   private handleNativeSeekedEvent(): void {
+    if (performance.now() < this.ignoreSeekEventsUntilMs) return;
     if (!this.settings.enabled) return;
+
     const capturedSession = this.playbackState.sessionId;
     if (this.seekDebounceTimer) clearTimeout(this.seekDebounceTimer);
 
-    // 200ms settle debounce prevents spamming GPU/Translator during rapid timeline scrubbing
+    // 160ms settle debounce prevents spamming network/TTS during rapid scrubbing, then snaps cleanly to cue start!
     this.seekDebounceTimer = setTimeout(() => {
+      this.seekDebounceTimer = null;
       if (capturedSession !== this.playbackState.sessionId) return;
-      void this.pumpPreparationQueue();
-      if (this.playbackState.intent === 'PLAY' || !this.video.paused) {
+
+      const alignedMs = this.alignPlayheadToSentenceStart();
+      const idx = resolveSegmentIndexAtVideoTime(this.segments, alignedMs);
+
+      // Immediately start pre-translating & pre-synthesizing target cue even while paused!
+      this.triggerBackgroundWorkers();
+
+      if (!this.video.paused || (this.wasPlayingBeforeScrub && this.playbackState.intent === 'PLAY')) {
+        this.wasPlayingBeforeScrub = false;
         this.playbackState = recordUserPlayIntent(this.playbackState);
-        void this.coordinateAtPlayhead(this.video.currentTime * 1000);
+        void this.coordinateAtPlayhead(alignedMs);
       } else {
-        // Update subtitle preview while paused at seek target
-        const idx = resolveSegmentIndexAtVideoTime(this.segments, this.video.currentTime * 1000);
-        const seg = idx >= 0 ? this.segments[idx] : undefined;
-        this.activeChunk = seg?.displayChunks?.[0] ?? null;
+        this.wasPlayingBeforeScrub = false;
+        if (idx >= 0) {
+          this.statusBanner = `Đã căn về đầu câu ${idx + 1}/${this.segments.length} — Bấm Play để nghe trọn câu`;
+        }
         this.emitSnapshot();
       }
-    }, 200);
+    }, 160);
   }
 
   private handleNativeRateChangeEvent(): void {
@@ -337,7 +478,6 @@ export class AdaptiveSyncCoordinator {
 
   private handleNativeTimeUpdate(): void {
     if (!this.settings.enabled) return;
-    // In Subtitle-Only fallback mode, render DisplayChunks directly off video.currentTime
     if (this.ttsDegradedSubtitleOnly) {
       const nowVideoMs = this.video.currentTime * 1000;
       const seg = this.segments.find((s) => nowVideoMs >= s.startMs && nowVideoMs <= s.endMs);
@@ -401,166 +541,198 @@ export class AdaptiveSyncCoordinator {
     return seg.status === 'READY' && seg.configVersion === this.activeConfigVersion;
   }
 
+  private triggerBackgroundWorkers(): void {
+    void this.pumpTranslationQueue();
+    void this.pumpTtsQueue();
+  }
+
   /**
-   * Continuous background worker pulling from Two-Tier Preemptive Queue (P0 Urgent -> P1 Background)
+   * Producer Loop: Translates segments ahead of playhead (`P0_URGENT` -> `P1_BACKGROUND`)
+   * without blocking on local CPU TTS synthesis!
    */
-  private async pumpPreparationQueue(): Promise<void> {
-    if (this.workerLoopRunning || !this.settings.enabled) return;
-    this.workerLoopRunning = true;
+  private async pumpTranslationQueue(): Promise<void> {
+    if (this.translationLoopRunning || !this.settings.enabled) return;
+    this.translationLoopRunning = true;
 
     try {
       while (this.settings.enabled) {
         const playheadMs = this.video.currentTime * 1000;
         const queue = buildPreemptiveQueue(this.segments, playheadMs, this.activeConfigVersion);
-        if (queue.length === 0) break;
+        const untranslatedTask = queue.find(
+          (t) => !this.segments[t.segmentIndex]?.translatedText && this.segments[t.segmentIndex]?.status !== 'TRANSLATING',
+        );
+        if (!untranslatedTask) break;
 
-        // If running in Subtitle-Only degraded mode, skip segments that already have translatedText
-        const nextTask = this.ttsDegradedSubtitleOnly
-          ? queue.find((t) => !this.segments[t.segmentIndex]?.translatedText)
-          : queue[0];
+        const startIdx = untranslatedTask.segmentIndex;
+        const batchSize = untranslatedTask.tier === 'P0_URGENT' ? 4 : 12;
+        const batchIndices: number[] = [];
 
-        if (!nextTask) break;
-
-        const targetSeg = this.segments[nextTask.segmentIndex]!;
-        const capturedCfgVersion = this.activeConfigVersion;
-
-        // Step A: Context-window batch translation if untranslated
-        if (!targetSeg.translatedText) {
-          const batchSize = nextTask.tier === 'P0_URGENT' ? 3 : 12;
-          const batchIndices: number[] = [];
-          for (
-            let i = targetSeg.segmentIndex;
-            i < Math.min(this.segments.length, targetSeg.segmentIndex + batchSize);
-            i++
-          ) {
-            if (!this.segments[i]!.translatedText) {
-              batchIndices.push(i);
-            }
-          }
-
-          if (batchIndices.length > 0) {
-            const firstIdx = batchIndices[0]!;
-            const contextBefore: string[] = [];
-            if (firstIdx >= 2) contextBefore.push(this.segments[firstIdx - 2]!.sourceText);
-            if (firstIdx >= 1) contextBefore.push(this.segments[firstIdx - 1]!.sourceText);
-
-            for (const idx of batchIndices) {
-              this.segments[idx]!.status = 'TRANSLATING';
-            }
-            this.emitSnapshot();
-
-            try {
-              const provider = this.getTranslationProvider();
-              const translatedItems = await provider.translateBatch({
-                sourceLang: 'en',
-                targetLang: 'vi',
-                contextBefore,
-                items: batchIndices.map((idx) => ({
-                  segmentId: this.segments[idx]!.segmentId,
-                  sourceText: this.segments[idx]!.sourceText,
-                })),
-              });
-
-              const configSnap = toSynthesisConfigSnapshot(this.settings);
-              for (const item of translatedItems) {
-                const seg = this.segments.find((s) => s.segmentId === item.segmentId);
-                if (seg) {
-                  seg.translatedText = item.translatedText;
-                  seg.displayChunks = splitIntoDisplayChunks(
-                    seg.segmentId,
-                    item.translatedText,
-                    seg.sourceText,
-                  );
-                  seg.audioCacheKey = buildAudioCacheKey(item.translatedText, configSnap);
-                  seg.status = 'TRANSLATED';
-                }
-              }
-
-              await this.persistCurrentManifest();
-              this.emitSnapshot();
-            } catch (err) {
-              for (const idx of batchIndices) {
-                this.segments[idx]!.status = 'ERROR';
-                this.segments[idx]!.errorMessage = err instanceof Error ? err.message : 'Lỗi dịch';
-              }
-              this.emitSnapshot();
-              await new Promise((r) => setTimeout(r, 1200));
-              continue;
-            }
+        for (let i = startIdx; i < Math.min(this.segments.length, startIdx + batchSize); i++) {
+          const s = this.segments[i]!;
+          if (!s.translatedText && s.status !== 'TRANSLATING') {
+            batchIndices.push(i);
           }
         }
+        if (batchIndices.length === 0) break;
 
-        // Step B: Synthesize WAV via local TTS service (unless degraded to Subtitle-Only)
-        if (!this.ttsDegradedSubtitleOnly && targetSeg.translatedText && targetSeg.audioCacheKey) {
-          targetSeg.status = 'SYNTHESIZING';
+        const firstIdx = batchIndices[0]!;
+        const contextBefore: string[] = [];
+        if (firstIdx >= 2) contextBefore.push(this.segments[firstIdx - 2]!.sourceText);
+        if (firstIdx >= 1) contextBefore.push(this.segments[firstIdx - 1]!.sourceText);
+
+        for (const idx of batchIndices) {
+          this.segments[idx]!.status = 'TRANSLATING';
+        }
+        this.emitSnapshot();
+
+        try {
+          const provider = this.getTranslationProvider();
+          const translatedItems = await provider.translateBatch({
+            sourceLang: 'en',
+            targetLang: 'vi',
+            contextBefore,
+            items: batchIndices.map((idx) => ({
+              segmentId: this.segments[idx]!.segmentId,
+              sourceText: this.segments[idx]!.sourceText,
+            })),
+          });
+
+          const configSnap = toSynthesisConfigSnapshot(this.settings);
+          for (const item of translatedItems) {
+            const seg = this.segments.find((s) => s.segmentId === item.segmentId);
+            if (seg) {
+              seg.translatedText = item.translatedText;
+              seg.displayChunks = splitIntoDisplayChunks(
+                seg.segmentId,
+                item.translatedText,
+                seg.sourceText,
+              );
+              seg.audioCacheKey = buildAudioCacheKey(item.translatedText, configSnap);
+              seg.status = 'TRANSLATED';
+
+              // Live-upgrade paused subtitle preview from English -> Vietnamese!
+              if (this.video.paused && this.playbackState.activeSegmentIndex === seg.segmentIndex) {
+                this.updatePreviewChunkForSegment(seg.segmentIndex);
+              }
+            }
+          }
+
+          await this.persistCurrentManifest();
           this.emitSnapshot();
 
-          try {
-            const synthRes = await this.ttsClient.synthesize({
-              audioCacheKey: targetSeg.audioCacheKey,
-              text: targetSeg.translatedText,
-              voiceId: this.settings.voiceId,
-              engineId: this.settings.engineId,
-              sampleRate: this.settings.sampleRate,
-            });
-
-            // ConfigVersion guard (Invariant I6): Only mark READY on active manifest if config hasn't changed mid-flight
-            if (capturedCfgVersion === this.activeConfigVersion) {
-              targetSeg.audioDurationMs = synthRes.audioDurationMs;
-              targetSeg.status = 'READY';
-
-              // Preload Blob URL into memory if segment is inside urgent lookahead window
-              if (nextTask.tier === 'P0_URGENT' && !this.audioQueue.hasPreloaded(targetSeg.audioCacheKey)) {
-                const blobUrl = await this.ttsClient.fetchAudioBlobUrl(targetSeg.audioCacheKey);
-                this.audioQueue.storePreloadedBlobUrl(targetSeg.audioCacheKey, blobUrl);
-              }
-
-              await this.persistCurrentManifest();
-              this.emitSnapshot();
-            }
-          } catch {
-            // Ping health once; if server went down, switch gracefully to Subtitle-Only mode!
-            try {
-              await this.ttsClient.checkHealth(2000);
-              targetSeg.status = 'ERROR';
-              targetSeg.errorMessage = 'Lỗi tạo âm thanh câu này';
-            } catch {
-              this.ttsDegradedSubtitleOnly = true;
-              this.video.volume = this.originalUserVideoVolume;
-              this.statusBanner = 'Mất kết nối Local TTS — Đã chuyển sang hiện Phụ đề tiếng Việt';
-            }
-            this.emitSnapshot();
+          // Wake TTS consumer immediately as soon as batch is translated!
+          void this.pumpTtsQueue();
+        } catch (err) {
+          for (const idx of batchIndices) {
+            this.segments[idx]!.status = 'ERROR';
+            this.segments[idx]!.errorMessage = err instanceof Error ? err.message : 'Lỗi dịch';
           }
+          this.emitSnapshot();
+          await new Promise((r) => setTimeout(r, 1200));
         }
       }
     } finally {
-      this.workerLoopRunning = false;
+      this.translationLoopRunning = false;
+    }
+  }
+
+  /**
+   * Consumer Loop: Synthesizes WAV audio for already-translated segments in strict `P0_URGENT` priority order.
+   */
+  private async pumpTtsQueue(): Promise<void> {
+    if (this.ttsLoopRunning || !this.settings.enabled || this.ttsDegradedSubtitleOnly) return;
+    this.ttsLoopRunning = true;
+
+    try {
+      while (this.settings.enabled && !this.ttsDegradedSubtitleOnly) {
+        const playheadMs = this.video.currentTime * 1000;
+        const queue = buildPreemptiveQueue(this.segments, playheadMs, this.activeConfigVersion);
+        const nextTtsTask = queue.find((t) => {
+          const s = this.segments[t.segmentIndex];
+          return Boolean(
+            s &&
+              s.translatedText &&
+              s.audioCacheKey &&
+              s.status !== 'READY' &&
+              s.status !== 'SYNTHESIZING' &&
+              s.status !== 'ERROR',
+          );
+        });
+
+        if (!nextTtsTask) break;
+
+        const targetSeg = this.segments[nextTtsTask.segmentIndex]!;
+        const capturedCfgVersion = this.activeConfigVersion;
+        targetSeg.status = 'SYNTHESIZING';
+        this.emitSnapshot();
+
+        try {
+          const synthRes = await this.ttsClient.synthesize({
+            audioCacheKey: targetSeg.audioCacheKey!,
+            text: targetSeg.translatedText!,
+            voiceId: this.settings.voiceId,
+            engineId: this.settings.engineId,
+            sampleRate: this.settings.sampleRate,
+          });
+
+          if (capturedCfgVersion === this.activeConfigVersion) {
+            targetSeg.audioDurationMs = synthRes.audioDurationMs;
+            targetSeg.status = 'READY';
+
+            if (nextTtsTask.tier === 'P0_URGENT' && !this.audioQueue.hasPreloaded(targetSeg.audioCacheKey!)) {
+              const blobUrl = await this.ttsClient.fetchAudioBlobUrl(targetSeg.audioCacheKey!);
+              this.audioQueue.storePreloadedBlobUrl(targetSeg.audioCacheKey!, blobUrl);
+            }
+
+            await this.persistCurrentManifest();
+            this.emitSnapshot();
+          }
+        } catch {
+          try {
+            await this.ttsClient.checkHealth(2000);
+            targetSeg.status = 'ERROR';
+            targetSeg.errorMessage = 'Lỗi tạo âm thanh câu này';
+          } catch {
+            this.ttsDegradedSubtitleOnly = true;
+            this.video.volume = this.originalUserVideoVolume;
+            this.statusBanner = 'Mất kết nối Local TTS — Đã chuyển sang hiện Phụ đề tiếng Việt';
+          }
+          this.emitSnapshot();
+        }
+      }
+    } finally {
+      this.ttsLoopRunning = false;
     }
   }
 
   /**
    * Coordinates Pause-Buffer-Resume Gate & Sequential Dual-Clock Playback starting from `targetVideoMs`.
+   * If `resumeBookmark` is provided (user paused mid-sentence and resumed without seeking), continues
+   * smoothly from `resumeBookmark.resumeOffsetSec`.
    */
-  private async coordinateAtPlayhead(targetVideoMs: number): Promise<void> {
+  private async coordinateAtPlayhead(
+    targetVideoMs: number,
+    resumeBookmark?: StoredPauseBookmark,
+  ): Promise<void> {
     if (!this.settings.enabled || this.segments.length === 0) return;
 
     const myLoopId = ++this.playbackLoopId;
     const activeSession = this.playbackState.sessionId;
-    void this.pumpPreparationQueue();
+    this.triggerBackgroundWorkers();
 
-    const startIdx = resolveSegmentIndexAtVideoTime(this.segments, targetVideoMs);
+    const startIdx = resumeBookmark
+      ? resumeBookmark.segmentIndex
+      : resolveSegmentIndexAtVideoTime(this.segments, targetVideoMs);
     if (startIdx === -1) return;
 
     const firstSeg = this.segments[startIdx]!;
-    // If playhead is in a long silent intro (> 5s before speech starts), let video play while preparing!
-    if (firstSeg.startMs - targetVideoMs > 5000 && !this.isSegmentPlayable(firstSeg)) {
+    if (!resumeBookmark && firstSeg.startMs - targetVideoMs > 5000 && !this.isSegmentPlayable(firstSeg)) {
       const waitVideoMs = firstSeg.startMs - targetVideoMs - 1500;
       const waitWallMs = Math.max(200, waitVideoMs / Math.max(0.5, this.video.playbackRate));
       await new Promise((r) => setTimeout(r, waitWallMs));
       if (myLoopId !== this.playbackLoopId || activeSession !== this.playbackState.sessionId) return;
     }
 
-    // Check required initial buffer window [k, k+1]
     const requiredIndices = getRequiredBufferIndices(this.segments, startIdx);
     const allReadyImmediately = requiredIndices.every((idx) =>
       this.isSegmentPlayable(this.segments[idx]!),
@@ -580,17 +752,14 @@ export class AdaptiveSyncCoordinator {
           this.isSegmentPlayable(this.segments[idx]!),
         ).length;
         const errored = requiredIndices.some((idx) => this.segments[idx]!.status === 'ERROR');
-        if (errored) break;
-
-        if (readyInWindow >= requiredIndices.length) break;
+        if (errored || readyInWindow >= requiredIndices.length) break;
 
         this.bufferingMessage = `Đang dịch & chuẩn bị giọng đọc... (${readyInWindow}/${requiredIndices.length})`;
         this.statusBanner = this.bufferingMessage;
         this.emitSnapshot();
 
-        void this.pumpPreparationQueue();
+        this.triggerBackgroundWorkers();
 
-        // Safety timeout: never trap user video forever if network/TTS hangs
         if (performance.now() - waitStartedMs > 12_000) {
           break;
         }
@@ -617,37 +786,41 @@ export class AdaptiveSyncCoordinator {
       return;
     }
 
-    // Duck original video volume smoothly during Vietnamese dubbing
     this.video.volume = Math.max(0, Math.min(1, this.settings.originalVideoVolumeRatio));
     this.statusBanner = 'Đang phát lồng tiếng Việt';
     this.emitSnapshot();
 
-    // Sequential Single-Voice Loop from startIdx -> end
     for (let idx = startIdx; idx < this.segments.length; idx++) {
       if (myLoopId !== this.playbackLoopId || activeSession !== this.playbackState.sessionId) return;
       if (this.playbackState.intent !== 'PLAY') return;
 
       const seg = this.segments[idx]!;
-      void this.pumpPreparationQueue();
+      const isResumingBookmarkedSeg =
+        resumeBookmark !== undefined &&
+        idx === resumeBookmark.segmentIndex &&
+        seg.audioCacheKey === resumeBookmark.audioCacheKey;
 
-      // Wait until current video time reaches near segment.startMs
-      while (true) {
-        if (myLoopId !== this.playbackLoopId || activeSession !== this.playbackState.sessionId) return;
-        if (this.playbackState.intent !== 'PLAY') return;
-        const nowVideoMs = this.video.currentTime * 1000;
-        const deltaVideoMs = seg.startMs - nowVideoMs;
-        if (deltaVideoMs <= 80) break;
-        await new Promise((r) => setTimeout(r, Math.min(100, deltaVideoMs / Math.max(0.5, this.video.playbackRate))));
+      this.triggerBackgroundWorkers();
+
+      if (!isResumingBookmarkedSeg) {
+        while (true) {
+          if (myLoopId !== this.playbackLoopId || activeSession !== this.playbackState.sessionId) return;
+          if (this.playbackState.intent !== 'PLAY') return;
+          const nowVideoMs = this.video.currentTime * 1000;
+          const deltaVideoMs = seg.startMs - nowVideoMs;
+          if (deltaVideoMs <= 80) break;
+          await new Promise((r) =>
+            setTimeout(r, Math.min(100, deltaVideoMs / Math.max(0.5, this.video.playbackRate))),
+          );
+        }
       }
 
-      // If this segment still isn't READY when playhead arrives, hold Buffer Gate cleanly!
       if (!this.isSegmentPlayable(seg) && seg.status !== 'ERROR') {
         await this.coordinateAtPlayhead(seg.startMs);
         return;
       }
 
       if (seg.status === 'ERROR' || !seg.audioCacheKey || !seg.audioDurationMs) {
-        // Invariant I7: Never silently hide missing audio; show translated/source subtitle + banner
         this.activeChunk = seg.displayChunks?.[0] ?? {
           chunkId: `${seg.segmentId}-fallback`,
           text: seg.translatedText ?? seg.sourceText,
@@ -658,40 +831,48 @@ export class AdaptiveSyncCoordinator {
         continue;
       }
 
-      // Lookahead 3-5 segments drift check
-      const drift = predictLookaheadDrift({
-        nowClockMs: performance.now(),
-        currentVideoTimeMs: this.video.currentTime * 1000,
-        userVideoRate: this.baseUserVideoRate,
-        prevAudioEndClockMs: this.prevAudioEndClockMs,
-        upcomingSegments: this.segments.slice(idx, idx + 5),
-        syncMode: this.settings.syncMode,
-        maxEffectiveSpeechRate: this.settings.maxEffectiveSpeechRate,
-      });
+      let effectiveSpeechRate: number;
+      let startOffsetSec = 0;
 
-      if (this.settings.syncMode === 'LEARNING_HOLD_VIDEO') {
-        this.programmaticSetVideoRate(this.baseUserVideoRate * drift.recommendedVideoRateMultiplier);
+      if (isResumingBookmarkedSeg && resumeBookmark) {
+        effectiveSpeechRate = resumeBookmark.effectiveSpeechRate;
+        startOffsetSec = resumeBookmark.resumeOffsetSec;
       } else {
-        this.programmaticSetVideoRate(this.baseUserVideoRate);
-      }
+        const drift = predictLookaheadDrift({
+          nowClockMs: performance.now(),
+          currentVideoTimeMs: this.video.currentTime * 1000,
+          userVideoRate: this.baseUserVideoRate,
+          prevAudioEndClockMs: this.prevAudioEndClockMs,
+          upcomingSegments: this.segments.slice(idx, idx + 5),
+          syncMode: this.settings.syncMode,
+          maxEffectiveSpeechRate: this.settings.maxEffectiveSpeechRate,
+        });
 
-      const schedule = planSegmentDualClock({
-        nowClockMs: performance.now(),
-        currentVideoTimeMs: this.video.currentTime * 1000,
-        videoRate: this.video.playbackRate || 1.0,
-        prevAudioEndClockMs: this.prevAudioEndClockMs,
-        segmentStartVideoMs: seg.startMs,
-        segmentEndVideoMs: seg.endMs,
-        nextSegmentStartVideoMs: seg.nextSegmentStartMs,
-        audioDurationMs: seg.audioDurationMs,
-        maxEffectiveSpeechRate: this.settings.maxEffectiveSpeechRate,
-      });
+        if (this.settings.syncMode === 'LEARNING_HOLD_VIDEO') {
+          this.programmaticSetVideoRate(this.baseUserVideoRate * drift.recommendedVideoRateMultiplier);
+        } else {
+          this.programmaticSetVideoRate(this.baseUserVideoRate);
+        }
 
-      const waitBeforeStartMs = Math.max(0, schedule.actualStartClockMs - performance.now());
-      if (waitBeforeStartMs > 15) {
-        await new Promise((r) => setTimeout(r, waitBeforeStartMs));
+        const schedule = planSegmentDualClock({
+          nowClockMs: performance.now(),
+          currentVideoTimeMs: this.video.currentTime * 1000,
+          videoRate: this.video.playbackRate || 1.0,
+          prevAudioEndClockMs: this.prevAudioEndClockMs,
+          segmentStartVideoMs: seg.startMs,
+          segmentEndVideoMs: seg.endMs,
+          nextSegmentStartVideoMs: seg.nextSegmentStartMs,
+          audioDurationMs: seg.audioDurationMs,
+          maxEffectiveSpeechRate: this.settings.maxEffectiveSpeechRate,
+        });
+
+        const waitBeforeStartMs = Math.max(0, schedule.actualStartClockMs - performance.now());
+        if (waitBeforeStartMs > 15) {
+          await new Promise((r) => setTimeout(r, waitBeforeStartMs));
+        }
+        if (myLoopId !== this.playbackLoopId || activeSession !== this.playbackState.sessionId) return;
+        effectiveSpeechRate = schedule.effectiveSpeechRate;
       }
-      if (myLoopId !== this.playbackLoopId || activeSession !== this.playbackState.sessionId) return;
 
       let blobUrl = this.audioQueue.getBlobUrl(seg.audioCacheKey);
       if (!blobUrl) {
@@ -704,21 +885,34 @@ export class AdaptiveSyncCoordinator {
       }
 
       this.playbackState = { ...this.playbackState, activeSegmentIndex: idx };
-      this.activeChunk = seg.displayChunks?.[0] ?? null;
+      if (!isResumingBookmarkedSeg) {
+        this.activeChunk = seg.displayChunks?.[0] ?? null;
+      }
       this.emitSnapshot();
 
       try {
         await this.audioQueue.playSegment({
           segmentIndex: idx,
+          audioCacheKey: seg.audioCacheKey,
           blobUrl,
-          effectiveSpeechRate: schedule.effectiveSpeechRate,
+          effectiveSpeechRate,
+          startOffsetSec,
         });
-        this.prevAudioEndClockMs = performance.now();
       } catch {
-        // Stopped due to seek/pause or transient decode error
+        // Interrupted or transient decode error
       }
 
-      // If in LEARNING_HOLD_VIDEO mode and next sentence already passed by > 1.5s, hold video briefly at boundary
+      // If stopped due to Pause or Seek, exit immediately without touching prevAudioEndClockMs or wiping activeChunk!
+      if (
+        myLoopId !== this.playbackLoopId ||
+        activeSession !== this.playbackState.sessionId ||
+        this.playbackState.intent !== 'PLAY'
+      ) {
+        return;
+      }
+
+      this.prevAudioEndClockMs = performance.now();
+
       if (
         this.settings.syncMode === 'LEARNING_HOLD_VIDEO' &&
         seg.nextSegmentStartMs !== null &&

@@ -90,6 +90,18 @@ it can create an amount of amazing effects.
     );
   });
 
+  it('ignores Udemy timeline thumbnail sprite VTT cues (#xywh=)', () => {
+    const spriteVtt = `WEBVTT
+
+00:00.000 --> 00:05.000
+thumb-sprites.jpg#xywh=0,0,160,90
+
+00:05.000 --> 00:10.000
+thumb-sprites.jpg#xywh=160,0,160,90
+`;
+    expect(parseVtt(spriteVtt)).toHaveLength(0);
+  });
+
   it('splits a 46-word Vietnamese translation into compact 1-2 line DisplayChunks without losing any words', () => {
     const longVi =
       'Trong bài học hôm nay, chúng ta sẽ tìm hiểu cách cấu hình thành phần Rigidbody2D trong Unity, sau đó kết hợp với Collider để xử lý va chạm vật lý một cách mượt mà, chính xác và không làm giảm tốc độ khung hình của trò chơi.';

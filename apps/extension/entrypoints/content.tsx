@@ -430,7 +430,13 @@ export default defineContentScript({
     }
 
     async function extractStandardHtml5Cues(video: HTMLVideoElement): Promise<SubtitleCue[]> {
-      const trackEls = Array.from(video.querySelectorAll('track'));
+      const trackEls = Array.from(video.querySelectorAll('track')).filter((el) => {
+        const kind = (el.getAttribute('kind') ?? '').toLowerCase();
+        const src = el.getAttribute('src') ?? '';
+        if (kind === 'metadata' || kind === 'chapters') return false;
+        if (/(?:sprite|thumb|storyboard)/i.test(src)) return false;
+        return true;
+      });
       const sortedTrackEls = [...trackEls].sort((a, b) => {
         const aEn = (a.getAttribute('srclang') ?? '').toLowerCase().startsWith('en') ? 0 : 1;
         const bEn = (b.getAttribute('srclang') ?? '').toLowerCase().startsWith('en') ? 0 : 1;

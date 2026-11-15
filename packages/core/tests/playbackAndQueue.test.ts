@@ -8,6 +8,7 @@ import {
   recordSeekInitiated,
   recordUserPauseIntent,
   recordUserPlayIntent,
+  resolveSeekTargetWithSnap,
   resolveSegmentIndexAtVideoTime,
   type SpeechSegment,
 } from '../src/index';
@@ -65,6 +66,27 @@ describe('PlaybackIntentMachine & Two-Tier Preemptive Queue (Invariants I1, I6, 
     expect(resolveSegmentIndexAtVideoTime(segments, 24_500)).toBe(2); // 56%
     expect(resolveSegmentIndexAtVideoTime(segments, 27_600)).toBe(2); // 95% -> still replays Segment 2 completely!
     expect(resolveSegmentIndexAtVideoTime(segments, 28_000)).toBe(3); // Past Segment 2 end -> moves to Segment 3
+  });
+
+  it('computes cue-start snap timestamp when user seeks into the middle of a segment', () => {
+    const segments = makeDummySegments(5);
+    // Mid-segment seek at 24_500ms inside Segment 2 [20_000 .. 28_000) -> snaps back to 20_000ms!
+    expect(resolveSeekTargetWithSnap(segments, 24_500)).toEqual({
+      segmentIndex: 2,
+      snapVideoTimeMs: 20_000,
+    });
+
+    // Seek right at segment start (20_100ms, within 250ms threshold) -> no snap needed
+    expect(resolveSeekTargetWithSnap(segments, 20_100)).toEqual({
+      segmentIndex: 2,
+      snapVideoTimeMs: null,
+    });
+
+    // Seek inside silent gap [18_000 .. 20_000) before Segment 2 -> targets Segment 2 without snapping backward
+    expect(resolveSeekTargetWithSnap(segments, 19_000)).toEqual({
+      segmentIndex: 2,
+      snapVideoTimeMs: null,
+    });
   });
 
   it('preempts queue to P0_URGENT at seek target and skips already-READY cached segments', () => {

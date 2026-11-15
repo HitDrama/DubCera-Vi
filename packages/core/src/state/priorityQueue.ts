@@ -10,16 +10,16 @@ export interface PrioritizedSegmentTask {
 }
 
 export interface QueuePrioritizationOptions {
-  urgentWindowVideoMs?: number; // Default 30_000ms ahead of playhead
-  urgentMinCount?: number;      // Ensure at least 4 upcoming segments are P0
+  urgentWindowVideoMs?: number;   // Default 30_000ms ahead of playhead
+  urgentMinCount?: number;        // Ensure at least 4 upcoming segments are P0
+  maxLookaheadVideoMs?: number;   // Optional sliding lookahead cap (e.g. 45_000ms) so 3h videos never run unboundedly
+  maxLookaheadCount?: number;     // Optional max forward segment count cap (e.g. 6-12 segments)
+  includeBackfill?: boolean;      // Whether to queue earlier segments behind playhead (default true)
 }
 
 /**
  * Builds a seek-aware, two-tier work queue excluding segments that are already `READY` for `activeConfigVersion`.
- * Order of execution:
- * 1. P0_URGENT: Segments at/ahead of playhead within urgentWindowVideoMs (or urgentMinCount), ordered sequentially.
- * 2. P1_BACKGROUND (Forward): Remaining segments from after P0 to the end of the video, ordered sequentially.
- * 3. P1_BACKGROUND (Backfill): Uncached segments earlier than playhead, ordered from closest/start to fill full-video cache.
+ * Supports optional sliding lookahead caps so long 3-hour lectures only process segments near the active playhead.
  */
 export function buildPreemptiveQueue(
   segments: ReadonlyArray<SpeechSegment>,
@@ -29,6 +29,9 @@ export function buildPreemptiveQueue(
 ): PrioritizedSegmentTask[] {
   const urgentWindowVideoMs = options.urgentWindowVideoMs ?? 30_000;
   const urgentMinCount = options.urgentMinCount ?? 4;
+  const maxLookaheadVideoMs = options.maxLookaheadVideoMs;
+  const maxLookaheadCount = options.maxLookaheadCount;
+  const includeBackfill = options.includeBackfill ?? true;
 
   const pending = segments.filter(
     (s) => !(s.status === 'READY' && s.configVersion === activeConfigVersion),
@@ -42,7 +45,7 @@ export function buildPreemptiveQueue(
   for (const seg of pending) {
     if (seg.endMs > playheadVideoMs) {
       forwardOrCurrent.push(seg);
-    } else {
+    } else if (includeBackfill) {
       earlierBackfill.push(seg);
     }
   }
@@ -52,8 +55,21 @@ export function buildPreemptiveQueue(
 
   const tasks: PrioritizedSegmentTask[] = [];
 
-  forwardOrCurrent.forEach((seg, idx) => {
+  for (let idx = 0; idx < forwardOrCurrent.length; idx++) {
+    const seg = forwardOrCurrent[idx]!;
     const distanceVideoMs = Math.max(0, seg.startMs - playheadVideoMs);
+
+    if (maxLookaheadCount !== undefined && tasks.length >= maxLookaheadCount) {
+      break;
+    }
+    if (
+      maxLookaheadVideoMs !== undefined &&
+      tasks.length >= Math.min(2, urgentMinCount) &&
+      distanceVideoMs > maxLookaheadVideoMs
+    ) {
+      break;
+    }
+
     const isUrgent = idx < urgentMinCount || distanceVideoMs <= urgentWindowVideoMs;
     tasks.push({
       segmentIndex: seg.segmentIndex,
@@ -61,15 +77,17 @@ export function buildPreemptiveQueue(
       tier: isUrgent ? 'P0_URGENT' : 'P1_BACKGROUND',
       distanceVideoMs,
     });
-  });
+  }
 
-  for (const seg of earlierBackfill) {
-    tasks.push({
-      segmentIndex: seg.segmentIndex,
-      segmentId: seg.segmentId,
-      tier: 'P1_BACKGROUND',
-      distanceVideoMs: Math.abs(playheadVideoMs - seg.startMs),
-    });
+  if (includeBackfill) {
+    for (const seg of earlierBackfill) {
+      tasks.push({
+        segmentIndex: seg.segmentIndex,
+        segmentId: seg.segmentId,
+        tier: 'P1_BACKGROUND',
+        distanceVideoMs: Math.abs(playheadVideoMs - seg.startMs),
+      });
+    }
   }
 
   return tasks;

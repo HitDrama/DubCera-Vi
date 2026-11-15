@@ -109,13 +109,19 @@ export class SingleAudioQueue {
     }
   }
 
-  public dispose(): void {
-    this.stopImmediate();
+  public clearBlobCache(): void {
     for (const url of this.blobUrlCache.values()) {
-      URL.revokeObjectURL(url);
+      if (this.audioEl.src !== url) {
+        URL.revokeObjectURL(url);
+      }
     }
     this.blobUrlCache.clear();
     this.accessOrder = [];
+  }
+
+  public dispose(): void {
+    this.stopImmediate();
+    this.clearBlobCache();
   }
 
   /**

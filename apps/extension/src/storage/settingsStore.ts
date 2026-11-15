@@ -15,12 +15,14 @@ export interface DubCeraSettings {
   hardwareProfile: HardwareProfilePreference;
   syncMode: SyncMode;
   subtitleMode: SubtitleDisplayMode;
+  minEffectiveSpeechRate: number;
   maxEffectiveSpeechRate: number;
   originalVideoVolumeRatio: number; // e.g. 0.12 (12% background ducked volume)
   translationProvider: 'free-web' | 'openai-compatible';
   llmEndpointUrl: string;
   llmApiKey: string;
   llmModel: string;
+  cacheInvalidatedAtMs: number;
 }
 
 export const DEFAULT_SETTINGS: DubCeraSettings = {
@@ -33,12 +35,14 @@ export const DEFAULT_SETTINGS: DubCeraSettings = {
   hardwareProfile: 'AUTO',
   syncMode: 'LEARNING_HOLD_VIDEO',
   subtitleMode: 'BILINGUAL',
+  minEffectiveSpeechRate: 1.0,
   maxEffectiveSpeechRate: 1.2,
   originalVideoVolumeRatio: 0.12,
   translationProvider: 'free-web',
   llmEndpointUrl: 'https://api.openai.com/v1/chat/completions',
   llmApiKey: '',
   llmModel: 'gpt-4o-mini',
+  cacheInvalidatedAtMs: 0,
 };
 
 const STORAGE_KEY = 'dubcera_settings_v1';
@@ -48,12 +52,17 @@ export async function loadSettings(): Promise<DubCeraSettings> {
     if (typeof chrome !== 'undefined' && chrome.storage?.local) {
       const data = await chrome.storage.local.get(STORAGE_KEY);
       if (data && data[STORAGE_KEY]) {
-        return { ...DEFAULT_SETTINGS, ...(data[STORAGE_KEY] as Partial<DubCeraSettings>) };
+        const merged = { ...DEFAULT_SETTINGS, ...(data[STORAGE_KEY] as Partial<DubCeraSettings>) };
+        // Guarantee baseline voice speed never drops below 1.0x even if an older 0.8x value was saved
+        merged.minEffectiveSpeechRate = Math.max(1.0, merged.minEffectiveSpeechRate || 1.0);
+        return merged;
       }
     } else if (typeof localStorage !== 'undefined') {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        return { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<DubCeraSettings>) };
+        const merged = { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<DubCeraSettings>) };
+        merged.minEffectiveSpeechRate = Math.max(1.0, merged.minEffectiveSpeechRate || 1.0);
+        return merged;
       }
     }
   } catch {

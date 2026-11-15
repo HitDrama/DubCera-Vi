@@ -7,12 +7,12 @@ from pathlib import Path
 
 def compute_safe_cpu_threads() -> int:
     logical = os.cpu_count() or 4
-    # Leave 1-2 threads free so browser video decoding & UI never stutter on CPU-only laptops
+    # Match physical core count (~logical // 2 on SMT CPUs like 4C/8T i3-12100F) so browser & OS stay responsive
     if logical <= 2:
         return 1
     if logical <= 4:
-        return logical - 1
-    return max(2, logical - 2)
+        return max(2, logical - 1)
+    return min(6, max(2, logical // 2))
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,7 @@ class ServiceConfig:
     cache_dir: Path
     models_dir: Path
     cache_max_bytes: int
+    cache_ttl_seconds: int
     max_text_chars: int
     max_cpu_threads: int
     hardware_profile: str  # "auto" | "gpu_turbo" | "cpu_eco" | "cloud_hybrid"
@@ -49,6 +50,7 @@ class ServiceConfig:
         cache_dir = Path(os.getenv("DUBCERA_CACHE_DIR", str(root / "cache")))
         models_dir = Path(os.getenv("DUBCERA_MODELS_DIR", str(root / "models")))
         cache_max_gb = float(os.getenv("DUBCERA_CACHE_MAX_GB", "5.0"))
+        cache_ttl_hours = float(os.getenv("DUBCERA_CACHE_TTL_HOURS", "24.0"))
         max_text_chars = int(os.getenv("DUBCERA_MAX_TEXT_CHARS", "1000"))
         hardware_profile = os.getenv("DUBCERA_HARDWARE_PROFILE", "auto").strip().lower()
 
@@ -61,6 +63,7 @@ class ServiceConfig:
             cache_dir=cache_dir,
             models_dir=models_dir,
             cache_max_bytes=int(cache_max_gb * (1024**3)),
+            cache_ttl_seconds=max(60, int(cache_ttl_hours * 3600)),
             max_text_chars=max_text_chars,
             max_cpu_threads=compute_safe_cpu_threads(),
             hardware_profile=hardware_profile,

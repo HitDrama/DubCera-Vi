@@ -35,6 +35,11 @@ class CacheVerifyResponse(BaseModel):
     validItems: dict[str, VerifiedAudioItem]
 
 
+class CacheClearResponse(BaseModel):
+    deletedCount: int
+    freedBytes: int
+
+
 class SynthesizeRequest(BaseModel):
     audioCacheKey: str = Field(min_length=16, max_length=128, pattern=r"^[a-fA-F0-9]+$")
     text: str = Field(min_length=1, max_length=2000)

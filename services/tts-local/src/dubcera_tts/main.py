@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 import time
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
@@ -9,6 +11,7 @@ from .cache_store import AtomicAudioCacheStore, CachedAudioRecord
 from .config import ServiceConfig
 from .engines.registry import EngineRegistry
 from .schemas import (
+    CacheClearResponse,
     CacheVerifyRequest,
     CacheVerifyResponse,
     HealthResponse,
@@ -22,15 +25,42 @@ from .singleflight import SingleflightGroup
 
 def create_app(custom_config: ServiceConfig | None = None) -> FastAPI:
     config = custom_config or ServiceConfig.from_env()
-    cache_store = AtomicAudioCacheStore(cache_dir=config.cache_dir, max_bytes=config.cache_max_bytes)
+    cache_store = AtomicAudioCacheStore(
+        cache_dir=config.cache_dir,
+        max_bytes=config.cache_max_bytes,
+        ttl_seconds=config.cache_ttl_seconds,
+    )
     registry = EngineRegistry(config=config)
     singleflight = SingleflightGroup[CachedAudioRecord]()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        cache_store.enforce_quota()
+
+        async def _periodic_cache_reaper() -> None:
+            while True:
+                await asyncio.sleep(600)
+                try:
+                    await asyncio.to_thread(cache_store.enforce_quota)
+                except Exception:
+                    pass
+
+        reaper_task = asyncio.create_task(_periodic_cache_reaper())
+        try:
+            yield
+        finally:
+            reaper_task.cancel()
+            try:
+                await reaper_task
+            except asyncio.CancelledError:
+                pass
 
     app = FastAPI(
         title="DubCera Local TTS Service",
         version=__version__,
         docs_url="/docs" if config.dev_sandbox_enabled else None,
         redoc_url=None,
+        lifespan=lifespan,
     )
 
     @app.middleware("http")
@@ -86,6 +116,12 @@ def create_app(custom_config: ServiceConfig | None = None) -> FastAPI:
             }
         )
 
+    @app.post("/v1/cache/clear", response_model=CacheClearResponse)
+    async def clear_cache(request: Request) -> CacheClearResponse:
+        verify_request_security(request, config)
+        deleted_count, freed_bytes = cache_store.clear_all()
+        return CacheClearResponse(deletedCount=deleted_count, freedBytes=freed_bytes)
+
     @app.post("/v1/synthesize", response_model=SynthesizeResponse)
     async def synthesize_speech(payload: SynthesizeRequest, request: Request) -> SynthesizeResponse:
         verify_request_security(request, config)
@@ -116,12 +152,16 @@ def create_app(custom_config: ServiceConfig | None = None) -> FastAPI:
                 audioUrl=f"/v1/audio/{cached.cache_key}",
             )
 
-        # 2. Singleflight deduplicated synthesis
+        # 2. Singleflight deduplicated synthesis (aborts early if client already closed session/tab)
+        if await request.is_disconnected():
+            raise HTTPException(status_code=499, detail="Client disconnected before synthesis")
+
         async def _produce() -> CachedAudioRecord:
-            # Double-check inside leader in case an earlier flight just finished
             again = cache_store.get_valid(cache_key)
             if again is not None:
                 return again
+            if await request.is_disconnected():
+                raise HTTPException(status_code=499, detail="Client disconnected")
             out = await registry.synthesize(
                 engine_id=payload.engineId,
                 text=cleaned_text,

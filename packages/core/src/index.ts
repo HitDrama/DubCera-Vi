@@ -17,3 +17,4 @@ export * from './state/priorityQueue';
 
 export * from './translation/glossary';
 export * from './translation/types';
+export * from './translation/dubbingNaturalizer';

@@ -22,7 +22,11 @@ const ELLIPSIS_END = /(?:\.\.\.|…)\s*["')\]]*$/;
 const CLAUSE_BREAK_END = /[,;:—–]["')\]]*$/;
 const SPEAKER_CHANGE_START = /^(-\s+|>>\s*|\[[^\]]+\]:?\s*|[A-Z][A-Z0-9 _]{1,18}:\s+)/;
 const CONJUNCTION_START =
-  /^(and|but|or|because|so|which|that|when|while|if|although|then|now|here|where)\b/i;
+  /^(and|but|or|because|so|which|that|when|while|if|although|then|now|here|where|however|first|next|finally|also|let's|let us|alright|okay)\b/i;
+const ASR_DISCOURSE_BREAK_START =
+  /^(so|and so|and then|now|because|but|however|first|second|next|finally|also|let's|let us|alright|okay|if we|if you|when we|when you|here we|in this)\b/i;
+const DANGLING_FUNCTION_TAIL =
+  /\b(?:to|of|in|on|at|for|with|from|by|about|into|onto|between|through|the|a|an|this|that|these|those|my|our|your|his|her|its|their|is|are|was|were|be|been|have|has|had|do|does|did|will|would|can|could|should|must|and|or|but|so|if|when|while|because|very|really|quite|more|most|going|want|need|how|what|where|who)$/i;
 const ELLIPTICAL_LIST_CONTINUATION_START =
   /^(or|nor|such as|including|especially|for example|for instance)\b/i;
 const SHORT_NOUN_FRAGMENT =
@@ -243,15 +247,24 @@ export function groupCuesIntoSegments(
     const combinedDurationMs = Math.max(0, span.endMs - firstSpan.startMs);
     const combinedWords = currentWords + spanWords;
 
-    const prevEndedSentence = STRONG_SENTENCE_END.test(prevSpan.text.trim());
+    const prevTrimmed = prevSpan.text.trim();
+    const nextTrimmed = span.text.trim();
+    const prevEndedSentence = STRONG_SENTENCE_END.test(prevTrimmed);
     const prevEndedPlainPeriod =
-      PLAIN_PERIOD_END.test(prevSpan.text.trim()) && !ELLIPSIS_END.test(prevSpan.text.trim());
-    const prevEndedClause = CLAUSE_BREAK_END.test(prevSpan.text.trim());
-    const nextChangesSpeaker = SPEAKER_CHANGE_START.test(span.text.trim());
-    const nextStartsConjunction = CONJUNCTION_START.test(span.text.trim());
+      PLAIN_PERIOD_END.test(prevTrimmed) && !ELLIPSIS_END.test(prevTrimmed);
+    const prevEndedClause = CLAUSE_BREAK_END.test(prevTrimmed);
+    const prevHasDanglingTail =
+      !prevEndedSentence && !prevEndedClause && DANGLING_FUNCTION_TAIL.test(prevTrimmed);
+    const nextChangesSpeaker = SPEAKER_CHANGE_START.test(nextTrimmed);
+    const nextStartsConjunction = CONJUNCTION_START.test(nextTrimmed);
+    const nextStartsAsrDiscourse = ASR_DISCOURSE_BREAK_START.test(nextTrimmed);
 
     const withinCeiling =
       combinedDurationMs <= maxSegmentDurationMs && combinedWords <= maxWordsPerSegment;
+    const withinDanglingGraceCeiling =
+      prevHasDanglingTail &&
+      combinedDurationMs <= maxSegmentDurationMs + 2_200 &&
+      combinedWords <= maxWordsPerSegment + 5;
 
     // Detect ASR false period inside an ongoing list or elliptical phrase (e.g. "A smoke.", "Or a fire simulation.")
     const isEllipticalContinuation =
@@ -259,8 +272,8 @@ export function groupCuesIntoSegments(
       !nextChangesSpeaker &&
       gapMs <= 320 &&
       withinCeiling &&
-      ((ELLIPTICAL_LIST_CONTINUATION_START.test(span.text.trim()) && spanWords <= 10) ||
-        (spanWords <= 3 && spanDurationMs <= 1_850 && SHORT_NOUN_FRAGMENT.test(span.text.trim())));
+      ((ELLIPTICAL_LIST_CONTINUATION_START.test(nextTrimmed) && spanWords <= 10) ||
+        (spanWords <= 3 && spanDurationMs <= 1_850 && SHORT_NOUN_FRAGMENT.test(nextTrimmed)));
 
     // Merge ultra-brief lead-in sentence spoken in the exact same breath (e.g. "Alright." + "Let's configure it.")
     const isSameBreathMicroLeadIn =
@@ -287,12 +300,27 @@ export function groupCuesIntoSegments(
     } else if (gapMs > maxGapMs) {
       shouldFlush = true;
     } else if (
-      (prevEndedClause || nextStartsConjunction) &&
-      (combinedDurationMs >= 9_000 || combinedWords >= 28)
+      !prevHasDanglingTail &&
+      nextStartsAsrDiscourse &&
+      !prevEndedClause &&
+      (currentWords >= 14 || currentDurationMs >= 4_800)
     ) {
-      // Natural breath/clause split ONLY once an unpunctuated auto-caption is genuinely long (>= 9s / 28 words)
+      // Clean clause boundary for unpunctuated YouTube ASR auto-captions
       shouldFlush = true;
-    } else if (!withinCeiling) {
+    } else if (
+      !prevHasDanglingTail &&
+      gapMs >= 280 &&
+      (currentWords >= 12 || currentDurationMs >= 4_200)
+    ) {
+      // Natural speaker breath pause on unpunctuated auto-captions
+      shouldFlush = true;
+    } else if (
+      !prevHasDanglingTail &&
+      (prevEndedClause || nextStartsConjunction) &&
+      (combinedDurationMs >= 8_200 || combinedWords >= 25)
+    ) {
+      shouldFlush = true;
+    } else if (!withinCeiling && !withinDanglingGraceCeiling) {
       shouldFlush = true;
     }
 

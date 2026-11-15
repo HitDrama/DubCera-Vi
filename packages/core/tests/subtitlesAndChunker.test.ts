@@ -127,4 +127,76 @@ thumb-sprites.jpg#xywh=160,0,160,90
       chunks[chunks.length - 1]?.chunkId,
     );
   });
+
+  it('reconstructs Udemy cross-cue enjambment + ASR list fragments ("realistic" | "explosions. A smoke. Or a fire simulation.")', () => {
+    const udemyTranscriptVtt = `WEBVTT
+
+1
+00:00.000 --> 00:04.000
+Like for example blender Houdini, 3ds Max or Maya.
+
+2
+00:04.000 --> 00:08.000
+And it can be useful for example to create realistic
+
+3
+00:08.000 --> 00:12.500
+explosions. A smoke. Or a fire simulation.
+`;
+
+    const cues = parseVtt(udemyTranscriptVtt);
+    const segments = groupCuesIntoSegments(cues);
+
+    expect(segments).toHaveLength(2);
+    expect(segments[0]?.sourceText).toBe(
+      'Like for example blender Houdini, 3ds Max or Maya.',
+    );
+    expect(segments[0]?.startMs).toBe(0);
+    expect(segments[0]?.endMs).toBe(4000);
+    expect(segments[0]?.flowProfile).toBe('CONTINUOUS_FLOW');
+
+    expect(segments[1]?.sourceText).toBe(
+      'And it can be useful for example to create realistic explosions, a smoke, or a fire simulation.',
+    );
+    expect(segments[1]?.startMs).toBe(4000);
+    expect(segments[1]?.endMs).toBe(12_500);
+    expect(segments[1]?.flowProfile).toBe('CONTINUOUS_FLOW');
+  });
+
+  it('splits multi-sentence cues at mid-cue periods and interpolates sub-cue timestamps accurately', () => {
+    const midCueSplitVtt = `WEBVTT
+
+1
+00:00.000 --> 00:04.500
+Like for example Maya. And it can be
+
+2
+00:04.500 --> 00:08.000
+useful to create realistic
+
+3
+00:08.000 --> 00:13.500
+explosions. Now let's open Unity Editor and inspect the Shader Graph.
+`;
+
+    const cues = parseVtt(midCueSplitVtt);
+    const segments = groupCuesIntoSegments(cues);
+
+    expect(segments).toHaveLength(3);
+    expect(segments[0]?.sourceText).toBe('Like for example Maya.');
+    expect(segments[0]?.startMs).toBe(0);
+    expect(segments[0]?.endMs).toBeGreaterThan(2200);
+    expect(segments[0]?.endMs).toBeLessThan(3500);
+
+    expect(segments[1]?.sourceText).toBe('And it can be useful to create realistic explosions.');
+    expect(segments[1]?.startMs).toBe(segments[0]?.endMs);
+    expect(segments[1]?.endMs).toBeGreaterThan(8800);
+    expect(segments[1]?.endMs).toBeLessThan(10_200);
+
+    expect(segments[2]?.sourceText).toBe(
+      "Now let's open Unity Editor and inspect the Shader Graph.",
+    );
+    expect(segments[2]?.startMs).toBe(segments[1]?.endMs);
+    expect(segments[2]?.endMs).toBe(13_500);
+  });
 });

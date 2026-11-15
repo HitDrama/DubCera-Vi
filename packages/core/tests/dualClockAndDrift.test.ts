@@ -87,4 +87,46 @@ describe('DualClockSpeedPlanner & 3-5 Segment Drift Predictor (Invariants I2, I3
     expect(strictResult.recommendedAction).toBe('WARN_DRIFT_ONLY');
     expect(strictResult.recommendedVideoRateMultiplier).toBe(1.0);
   });
+
+  it('keeps baseline speech crisp at 1.00x (never < 1.0x) while bridging continuous segments seamlessly', () => {
+    // 3.0s WAV inside a 4.0s continuous cue stays at crystal-clear 1.00x (never distorted at 0.8x)
+    const continuousPlan = planSegmentDualClock({
+      nowClockMs: 0,
+      currentVideoTimeMs: 0,
+      videoRate: 1.0,
+      prevAudioEndClockMs: 0,
+      segmentStartVideoMs: 0,
+      segmentEndVideoMs: 4000,
+      nextSegmentStartVideoMs: 4050,
+      audioDurationMs: 3000,
+      minEffectiveSpeechRate: 1.0,
+      maxEffectiveSpeechRate: 1.2,
+      flowProfile: 'CONTINUOUS_FLOW',
+      syllableCount: 15,
+    });
+
+    expect(continuousPlan.effectiveSpeechRate).toBe(1.0);
+    expect(continuousPlan.actualAudioDurationClockMs).toBe(3000);
+
+    // Next continuous segment bridges cleanly via allowEarlyLeadInClockMs without slowing voice below 1.0x
+    const bridgedNextPlan = planSegmentDualClock({
+      nowClockMs: 3750,
+      currentVideoTimeMs: 3750,
+      videoRate: 1.0,
+      prevAudioEndClockMs: 3750,
+      segmentStartVideoMs: 4050,
+      segmentEndVideoMs: 8000,
+      nextSegmentStartVideoMs: 8100,
+      audioDurationMs: 3200,
+      minEffectiveSpeechRate: 1.0,
+      maxEffectiveSpeechRate: 1.2,
+      flowProfile: 'CONTINUOUS_FLOW',
+      syllableCount: 16,
+      allowEarlyLeadInClockMs: 420,
+      minBreathGapClockMs: 160,
+    });
+
+    expect(bridgedNextPlan.actualStartClockMs).toBe(3910);
+    expect(bridgedNextPlan.effectiveSpeechRate).toBe(1.0);
+  });
 });

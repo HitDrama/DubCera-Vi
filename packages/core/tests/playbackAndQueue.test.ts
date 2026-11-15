@@ -107,4 +107,18 @@ describe('PlaybackIntentMachine & Two-Tier Preemptive Queue (Invariants I1, I6, 
     expect(queue[2]?.tier).toBe('P0_URGENT');
     expect(queue[queue.length - 1]?.tier).toBe('P1_BACKGROUND');
   });
+
+  it('caps background work to a sliding lookahead window on long 3-hour videos without backfill waste', () => {
+    const segments = makeDummySegments(100); // 1000s video
+    const queue = buildPreemptiveQueue(segments, 50_000, 'cfg-1', {
+      urgentWindowVideoMs: 20_000,
+      urgentMinCount: 2,
+      maxLookaheadVideoMs: 35_000,
+      maxLookaheadCount: 4,
+      includeBackfill: false,
+    });
+
+    // Must ONLY include segments [5, 6, 7, 8] ahead of 50s — zero backfill (0..4) and zero tail (9..99)!
+    expect(queue.map((t) => t.segmentIndex)).toEqual([5, 6, 7, 8]);
+  });
 });

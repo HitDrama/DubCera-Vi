@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,7 +33,13 @@ class ServiceConfig:
 
     @classmethod
     def from_env(cls, base_dir: Path | None = None) -> ServiceConfig:
-        root = base_dir or Path(__file__).resolve().parents[2]
+        if base_dir is not None:
+            root = base_dir
+        elif getattr(sys, "frozen", False):
+            local_app_data = os.getenv("LOCALAPPDATA")
+            root = (Path(local_app_data) if local_app_data else Path.home()) / "DubCera"
+        else:
+            root = Path(__file__).resolve().parents[2]
         host = os.getenv("DUBCERA_HOST", "127.0.0.1").strip()
         # Hard invariant: strictly loopback only
         if host not in ("127.0.0.1", "localhost"):

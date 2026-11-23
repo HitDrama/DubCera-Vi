@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import os
+import signal
 import time
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
@@ -32,6 +34,8 @@ def create_app(custom_config: ServiceConfig | None = None) -> FastAPI:
     )
     registry = EngineRegistry(config=config)
     singleflight = SingleflightGroup[CachedAudioRecord]()
+    last_activity_monotonic = [time.monotonic()]
+    idle_shutdown_seconds = max(0, int(os.getenv("DUBCERA_IDLE_SHUTDOWN_SECONDS", "0")))
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -40,14 +44,26 @@ def create_app(custom_config: ServiceConfig | None = None) -> FastAPI:
         async def _periodic_cache_reaper() -> None:
             ticks = 0
             while True:
-                await asyncio.sleep(20)
+                await asyncio.sleep(15)
                 ticks += 1
                 try:
                     # Release ~1 GB ONNX model RAM automatically after 60s of inactivity
                     await registry.unload_idle_models(max_idle_seconds=60.0)
-                    # Sweep expired (>1 day) and >5 GB disk cache every 10 minutes (30 * 20s)
-                    if ticks % 30 == 0:
+                    # Sweep expired (>1 day) and >5 GB disk cache every ~10 minutes
+                    if ticks % 40 == 0:
                         await asyncio.to_thread(cache_store.enforce_quota)
+                    # Full process auto-shutdown when idle (0 MB RAM when user stops watching)
+                    if (
+                        idle_shutdown_seconds > 0
+                        and (time.monotonic() - last_activity_monotonic[0]) >= idle_shutdown_seconds
+                    ):
+                        await registry.unload_idle_models(max_idle_seconds=0.0)
+                        print(
+                            f"[DubCeraVoices] Idle >= {idle_shutdown_seconds}s — exiting cleanly to free RAM.",
+                            flush=True,
+                        )
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        return
                 except Exception:
                     pass
 
@@ -71,6 +87,7 @@ def create_app(custom_config: ServiceConfig | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def strict_cors_middleware(request: Request, call_next):
+        last_activity_monotonic[0] = time.monotonic()
         origin = request.headers.get("origin")
         if request.method == "OPTIONS":
             if origin and is_origin_allowed(origin, config):
@@ -228,7 +245,7 @@ def run_cli() -> None:
     import uvicorn
 
     cfg = ServiceConfig.from_env()
-    uvicorn.run("dubcera_tts.main:app", host=cfg.host, port=cfg.port, reload=False)
+    uvicorn.run(app, host=cfg.host, port=cfg.port, reload=False, log_level="info")
 
 
 if __name__ == "__main__":

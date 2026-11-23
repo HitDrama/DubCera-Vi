@@ -1,6 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import type { SubtitleDisplayMode, SyncMode } from '@dubcera/core';
-import type { DubCeraSettings, TranslationProviderKind } from '../storage/settingsStore';
+import {
+  DEFAULT_MODEL_BY_PROVIDER,
+  type DubCeraSettings,
+  type TranslationProviderKind,
+} from '../storage/settingsStore';
 import { BUILTIN_CLOUD_ENGINE_ID } from '../tts/builtinCloudTtsClient';
 import { LocalTtsClient, type LocalVoiceOption } from '../tts/localTtsClient';
 import {
@@ -19,13 +23,6 @@ export interface PlayerSettingsPopoverProps {
   onClose: () => void;
 }
 
-const DEFAULT_MODEL_BY_PROVIDER: Record<TranslationProviderKind, string> = {
-  'free-web': '',
-  gemini: 'gemini-2.5-flash',
-  groq: 'llama-3.3-70b-versatile',
-  'openai-compatible': 'gpt-4o-mini',
-};
-
 export const PlayerSettingsPopover: React.FC<PlayerSettingsPopoverProps> = ({
   open,
   settings,
@@ -35,11 +32,18 @@ export const PlayerSettingsPopover: React.FC<PlayerSettingsPopoverProps> = ({
   const [liveVoices, setLiveVoices] = useState<LocalVoiceOption[]>([]);
   const [serverOnline, setServerOnline] = useState<boolean | null>(null);
   const [apiKeyDraft, setApiKeyDraft] = useState(settings.llmApiKey);
+  const [modelDraft, setModelDraft] = useState(
+    settings.llmModel || DEFAULT_MODEL_BY_PROVIDER[settings.translationProvider],
+  );
   const [copiedCmd, setCopiedCmd] = useState(false);
 
   useEffect(() => {
     setApiKeyDraft(settings.llmApiKey);
   }, [settings.llmApiKey]);
+
+  useEffect(() => {
+    setModelDraft(settings.llmModel || DEFAULT_MODEL_BY_PROVIDER[settings.translationProvider]);
+  }, [settings.llmModel, settings.translationProvider]);
 
   useEffect(() => {
     if (!open) return;
@@ -242,9 +246,14 @@ export const PlayerSettingsPopover: React.FC<PlayerSettingsPopoverProps> = ({
           value={settings.translationProvider}
           onChange={(e) => {
             const nextProv = e.target.value as TranslationProviderKind;
+            const nextModel =
+              nextProv === settings.translationProvider
+                ? settings.llmModel
+                : DEFAULT_MODEL_BY_PROVIDER[nextProv] || settings.llmModel;
+            setModelDraft(nextModel);
             void onUpdateSettings({
               translationProvider: nextProv,
-              llmModel: DEFAULT_MODEL_BY_PROVIDER[nextProv] || settings.llmModel,
+              llmModel: nextModel,
             });
           }}
           style={{
@@ -264,14 +273,15 @@ export const PlayerSettingsPopover: React.FC<PlayerSettingsPopoverProps> = ({
         </select>
 
         {settings.translationProvider !== 'free-web' && (
-          <div style={{ display: 'flex', gap: '5px', marginTop: '6px' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '5px', marginTop: '6px' }}>
             <input
               type="password"
               placeholder="Dán API Key vào đây..."
               value={apiKeyDraft}
               onChange={(e) => setApiKeyDraft(e.target.value)}
               style={{
-                flex: 1,
+                width: '100%',
+                boxSizing: 'border-box',
                 padding: '5px 7px',
                 borderRadius: '5px',
                 background: '#1E293B',
@@ -280,22 +290,47 @@ export const PlayerSettingsPopover: React.FC<PlayerSettingsPopoverProps> = ({
                 fontSize: '11.5px',
               }}
             />
-            <button
-              type="button"
-              onClick={() => void onUpdateSettings({ llmApiKey: apiKeyDraft.trim() })}
-              style={{
-                padding: '5px 10px',
-                borderRadius: '5px',
-                border: 'none',
-                background: '#10B981',
-                color: '#052E16',
-                fontWeight: 700,
-                fontSize: '11.5px',
-                cursor: 'pointer',
-              }}
-            >
-              Lưu
-            </button>
+            <div style={{ display: 'flex', gap: '5px' }}>
+              <input
+                type="text"
+                placeholder={`Model (vd: ${DEFAULT_MODEL_BY_PROVIDER[settings.translationProvider] || 'gemini-3.5-flash-lite'})`}
+                value={modelDraft}
+                onChange={(e) => setModelDraft(e.target.value)}
+                style={{
+                  flex: 1,
+                  padding: '5px 7px',
+                  borderRadius: '5px',
+                  background: '#1E293B',
+                  color: '#F8FAFC',
+                  border: '1px solid #475569',
+                  fontSize: '11.5px',
+                }}
+              />
+              <button
+                type="button"
+                onClick={() =>
+                  void onUpdateSettings({
+                    llmApiKey: apiKeyDraft.trim(),
+                    llmModel:
+                      modelDraft.trim() ||
+                      DEFAULT_MODEL_BY_PROVIDER[settings.translationProvider] ||
+                      settings.llmModel,
+                  })
+                }
+                style={{
+                  padding: '5px 10px',
+                  borderRadius: '5px',
+                  border: 'none',
+                  background: '#10B981',
+                  color: '#052E16',
+                  fontWeight: 700,
+                  fontSize: '11.5px',
+                  cursor: 'pointer',
+                }}
+              >
+                Lưu
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -346,6 +381,29 @@ export const PlayerSettingsPopover: React.FC<PlayerSettingsPopoverProps> = ({
           </select>
         </div>
       </div>
+
+      <label
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '8px',
+          padding: '6px 8px',
+          borderRadius: '6px',
+          background: '#1E293B',
+          border: '1px solid #334155',
+          cursor: 'pointer',
+          color: '#E2E8F0',
+          fontSize: '11.5px',
+        }}
+      >
+        <span>Auto Theater (FastTrack)</span>
+        <input
+          type="checkbox"
+          checked={settings.fastTrackAutoTheater}
+          onChange={(e) => void onUpdateSettings({ fastTrackAutoTheater: e.target.checked })}
+        />
+      </label>
     </div>
   );
 };

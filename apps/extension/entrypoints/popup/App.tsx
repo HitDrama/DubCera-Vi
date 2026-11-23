@@ -3,6 +3,7 @@ import type { SubtitleDisplayMode, SyncMode } from '@dubcera/core';
 import { clearAllBuiltinAudioCache } from '../../src/storage/builtinAudioCacheDb';
 import { clearAllVideoManifests } from '../../src/storage/manifestDb';
 import {
+  DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_SETTINGS,
   loadSettings,
   saveSettings,
@@ -27,17 +28,10 @@ function formatBytesToMb(bytes: number): string {
   return `${mb.toFixed(1)} MB`;
 }
 
-const DEFAULT_MODEL_BY_PROVIDER: Record<TranslationProviderKind, string> = {
-  'free-web': '',
-  gemini: 'gemini-2.5-flash',
-  groq: 'llama-3.3-70b-versatile',
-  'openai-compatible': 'gpt-4o-mini',
-};
-
 export const App: React.FC = () => {
   const [settings, setSettings] = useState<DubCeraSettings>(DEFAULT_SETTINGS);
   const [apiKeyDraft, setApiKeyDraft] = useState('');
-  const [modelDraft, setModelDraft] = useState('gemini-2.5-flash');
+  const [modelDraft, setModelDraft] = useState(DEFAULT_MODEL_BY_PROVIDER.gemini);
   const [endpointDraft, setEndpointDraft] = useState('https://api.openai.com/v1/chat/completions');
   const [aiSavedNotice, setAiSavedNotice] = useState<string | null>(null);
   const [voices, setVoices] = useState<LocalVoiceOption[]>([]);
@@ -58,14 +52,26 @@ export const App: React.FC = () => {
   };
 
   useEffect(() => {
-    void (async () => {
+    const syncFromStorage = async (alsoCheckServer: boolean) => {
       const loaded = await loadSettings();
       setSettings(loaded);
       setApiKeyDraft(loaded.llmApiKey);
       setModelDraft(loaded.llmModel || DEFAULT_MODEL_BY_PROVIDER[loaded.translationProvider]);
       setEndpointDraft(loaded.llmEndpointUrl);
-      await checkLocalServer(loaded);
-    })();
+      if (alsoCheckServer) {
+        await checkLocalServer(loaded);
+      }
+    };
+
+    void syncFromStorage(true);
+
+    const onStorageChange = () => {
+      void syncFromStorage(false);
+    };
+    chrome.storage?.onChanged?.addListener(onStorageChange);
+    return () => {
+      chrome.storage?.onChanged?.removeListener(onStorageChange);
+    };
   }, []);
 
   const update = async (patch: Partial<DubCeraSettings>) => {
@@ -554,6 +560,29 @@ export const App: React.FC = () => {
             <option value="OFF">Ẩn Phụ đề (Chỉ nghe Voice)</option>
           </select>
         </div>
+
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '8px',
+            padding: '7px 9px',
+            borderRadius: '7px',
+            background: '#1E293B',
+            border: '1px solid #334155',
+            cursor: 'pointer',
+            color: '#E2E8F0',
+            fontSize: '12px',
+          }}
+        >
+          <span>Auto Theater Mode (FastTrackTutorials)</span>
+          <input
+            type="checkbox"
+            checked={settings.fastTrackAutoTheater}
+            onChange={(e) => void update({ fastTrackAutoTheater: e.target.checked })}
+          />
+        </label>
 
         <button
           type="button"

@@ -10,7 +10,7 @@ export interface StructuredTranslatedSentence {
 }
 
 export type DubCeraRpcRequest =
-  | { type: 'TTS_HEALTH'; baseUrl: string; token: string; timeoutMs?: number }
+  | { type: 'TTS_HEALTH'; baseUrl: string; token: string; timeoutMs?: number; autoStart?: boolean }
   | { type: 'TTS_VERIFY_CACHE'; baseUrl: string; token: string; cacheKeys: string[] }
   | {
       type: 'TTS_SYNTHESIZE';

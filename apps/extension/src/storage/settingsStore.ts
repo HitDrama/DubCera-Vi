@@ -7,6 +7,13 @@ import type {
 
 export type TranslationProviderKind = 'free-web' | 'gemini' | 'groq' | 'openai-compatible';
 
+export const DEFAULT_MODEL_BY_PROVIDER: Record<TranslationProviderKind, string> = {
+  'free-web': '',
+  gemini: 'gemini-3.5-flash-lite',
+  groq: 'llama-3.3-70b-versatile',
+  'openai-compatible': 'gpt-4o-mini',
+};
+
 export interface DubCeraSettings {
   enabled: boolean;
   localTtsUrl: string;
@@ -25,6 +32,7 @@ export interface DubCeraSettings {
   llmApiKey: string;
   llmModel: string;
   cacheInvalidatedAtMs: number;
+  fastTrackAutoTheater: boolean;
 }
 
 export const DEFAULT_SETTINGS: DubCeraSettings = {
@@ -43,8 +51,9 @@ export const DEFAULT_SETTINGS: DubCeraSettings = {
   translationProvider: 'free-web',
   llmEndpointUrl: 'https://api.openai.com/v1/chat/completions',
   llmApiKey: '',
-  llmModel: 'gemini-2.5-flash',
+  llmModel: 'gemini-3.5-flash-lite',
   cacheInvalidatedAtMs: 0,
+  fastTrackAutoTheater: true,
 };
 
 const STORAGE_KEY = 'dubcera_settings_v1';

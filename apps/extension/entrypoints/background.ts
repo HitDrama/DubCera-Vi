@@ -5,6 +5,44 @@ import type {
 } from '../src/bridges/extensionRpc';
 
 const activeSessionControllers = new Map<string, Set<AbortController>>();
+const NATIVE_VOICE_HOST_NAME = 'com.dubcera.voices';
+let nativeWakeInFlight: Promise<boolean> | null = null;
+
+function isLoopbackUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost';
+  } catch {
+    return false;
+  }
+}
+
+async function ensureLocalTtsServerRunning(): Promise<boolean> {
+  if (!chrome.runtime?.sendNativeMessage) return false;
+  if (nativeWakeInFlight) return nativeWakeInFlight;
+
+  nativeWakeInFlight = new Promise<boolean>((resolve) => {
+    try {
+      chrome.runtime.sendNativeMessage(
+        NATIVE_VOICE_HOST_NAME,
+        { action: 'ensure_running', idleShutdownSeconds: 180 },
+        (response?: { ok?: boolean }) => {
+          if (chrome.runtime.lastError) {
+            resolve(false);
+            return;
+          }
+          resolve(Boolean(response?.ok));
+        },
+      );
+    } catch {
+      resolve(false);
+    }
+  }).finally(() => {
+    nativeWakeInFlight = null;
+  });
+
+  return nativeWakeInFlight;
+}
 
 function registerSessionController(sessionTag?: string): {
   controller: AbortController;
@@ -105,7 +143,7 @@ async function handleAiLlmTranslate(
   }
 
   if (msg.provider === 'gemini') {
-    const modelName = (msg.model || 'gemini-2.5-flash').replace(/^models\//, '');
+    const modelName = (msg.model || 'gemini-3.5-flash-lite').replace(/^models\//, '');
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
     const resp = await fetch(geminiUrl, {
@@ -215,17 +253,31 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
     }
 
     case 'TTS_HEALTH': {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), msg.timeoutMs ?? 3500);
+      const fetchHealthOnce = async (timeoutMs: number) => {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+        try {
+          const resp = await fetch(`${msg.baseUrl.replace(/\/+$/, '')}/v1/health`, {
+            method: 'GET',
+            signal: ctrl.signal,
+          });
+          if (!resp.ok) throw new Error(`Health HTTP ${resp.status}`);
+          return await resp.json();
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
       try {
-        const resp = await fetch(`${msg.baseUrl.replace(/\/+$/, '')}/v1/health`, {
-          method: 'GET',
-          signal: ctrl.signal,
-        });
-        if (!resp.ok) throw new Error(`Health HTTP ${resp.status}`);
-        return await resp.json();
-      } finally {
-        clearTimeout(timer);
+        return await fetchHealthOnce(msg.timeoutMs ?? 3500);
+      } catch (err) {
+        if (msg.autoStart && isLoopbackUrl(msg.baseUrl)) {
+          const woke = await ensureLocalTtsServerRunning();
+          if (woke) {
+            return await fetchHealthOnce(5000);
+          }
+        }
+        throw err;
       }
     }
 
@@ -245,8 +297,8 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
 
     case 'TTS_SYNTHESIZE': {
       const { controller, cleanup } = registerSessionController(msg.sessionTag);
-      try {
-        const resp = await fetch(`${msg.baseUrl.replace(/\/+$/, '')}/v1/synthesize`, {
+      const sendSynth = () =>
+        fetch(`${msg.baseUrl.replace(/\/+$/, '')}/v1/synthesize`, {
           method: 'POST',
           signal: controller.signal,
           headers: {
@@ -265,6 +317,22 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
             pauseConfig: 'default',
           }),
         });
+      try {
+        let resp: Response;
+        try {
+          resp = await sendSynth();
+        } catch (netErr) {
+          if (!controller.signal.aborted && isLoopbackUrl(msg.baseUrl)) {
+            const woke = await ensureLocalTtsServerRunning();
+            if (woke) {
+              resp = await sendSynth();
+            } else {
+              throw netErr;
+            }
+          } else {
+            throw netErr;
+          }
+        }
         if (!resp.ok) {
           const detail = await resp.text().catch(() => '');
           throw new Error(`TTS synthesize HTTP ${resp.status}: ${detail}`);
@@ -394,7 +462,9 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
         (host.endsWith('.udemycdn.com') ||
           host.endsWith('.udemy.com') ||
           host === 'udemy.com' ||
-          host.endsWith('.youtube.com'));
+          host.endsWith('.youtube.com') ||
+          host === 'iframe.mediadelivery.net' ||
+          host.endsWith('.b-cdn.net'));
       if (!isAllowedSubtitleHost) {
         throw new Error(`Disallowed subtitle host: ${host}`);
       }

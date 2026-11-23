@@ -88,13 +88,14 @@ export class LocalTtsClient {
     };
   }
 
-  public async checkHealth(timeoutMs = 3500): Promise<LocalTtsHealth> {
-    if (isContentScriptContext()) {
+  public async checkHealth(timeoutMs = 3500, autoStart = false): Promise<LocalTtsHealth> {
+    if (isContentScriptContext() || (autoStart && typeof chrome !== 'undefined' && Boolean(chrome.runtime?.sendMessage))) {
       return sendBackgroundRpc<LocalTtsHealth>({
         type: 'TTS_HEALTH',
         baseUrl: this.baseUrl,
         token: this.authToken,
         timeoutMs,
+        autoStart,
       });
     }
 

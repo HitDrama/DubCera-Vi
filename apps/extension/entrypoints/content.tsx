@@ -1,6 +1,10 @@
 import React from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { parseVtt, type SubtitleCue } from '@dubcera/core';
+import {
+  extractBunnyEnglishCues,
+  parseBunnyEmbedVideoId,
+} from '../src/adapters/bunny/bunnyStreamAdapter';
 import { parseYouTubeTimedTextPayload } from '../src/adapters/youtube/youtubeTimedTextParser';
 import { sendBackgroundRpc } from '../src/bridges/extensionRpc';
 import { AdaptiveSyncCoordinator, type CoordinatorUiSnapshot } from '../src/coordinator/syncCoordinator';
@@ -17,9 +21,20 @@ import { PlayerSettingsPopover } from '../src/ui/PlayerSettingsPopover';
 import { SubtitleOverlay } from '../src/ui/SubtitleOverlay';
 
 export default defineContentScript({
-  matches: ['*://*.youtube.com/*', '*://*.udemy.com/*'],
+  matches: [
+    '*://*.youtube.com/*',
+    '*://*.udemy.com/*',
+    '*://iframe.mediadelivery.net/*',
+  ],
+  allFrames: true,
   runAt: 'document_idle',
   main() {
+    // YouTube & Udemy run strictly in top frame; Bunny Stream runs inside its embed iframe
+    const initialHost = location.hostname.toLowerCase();
+    const isBunnyHost = initialHost === 'iframe.mediadelivery.net';
+    if (!isBunnyHost && window !== window.top) {
+      return;
+    }
     let activeVideo: HTMLVideoElement | null = null;
     let activeVideoId = '';
     let coordinator: AdaptiveSyncCoordinator | null = null;
@@ -52,7 +67,8 @@ export default defineContentScript({
             '[class*="captions-display--captions-container"],',
             '[class*="captions-display--captions-cue-text"],',
             '.shaka-text-container,',
-            '.vjs-text-track-display {',
+            '.vjs-text-track-display,',
+            '.plyr__captions {',
             '  opacity: 0 !important;',
             '  pointer-events: none !important;',
             '}',
@@ -60,7 +76,7 @@ export default defineContentScript({
         : '';
     }
 
-    function resolvePlatformAndVideoId(): { platform: 'youtube' | 'udemy'; videoId: string } | null {
+    function resolvePlatformAndVideoId(): { platform: 'youtube' | 'udemy' | 'bunny'; videoId: string } | null {
       const host = location.hostname.toLowerCase();
       if (host.includes('youtube.com')) {
         const url = new URL(location.href);
@@ -76,6 +92,13 @@ export default defineContentScript({
           return { platform: 'udemy', videoId: lectureMatch[1] };
         }
         return { platform: 'udemy', videoId: location.pathname };
+      }
+      if (host === 'iframe.mediadelivery.net') {
+        const bunnyId = parseBunnyEmbedVideoId(location.href);
+        if (bunnyId) {
+          return { platform: 'bunny', videoId: bunnyId };
+        }
+        return null;
       }
       return null;
     }
@@ -120,24 +143,33 @@ export default defineContentScript({
 
     function togglePlayerSettingsPopover(): void {
       settingsPopoverOpen = !settingsPopoverOpen;
-      if (settingsPopoverOpen && !reactRoot) {
-        const pageVideo = activeVideo ?? (document.querySelector('video') as HTMLVideoElement | null);
-        if (pageVideo) {
-          mountOverlayContainer(pageVideo);
+      void (async () => {
+        if (settingsPopoverOpen) {
+          currentSettings = await loadSettings();
+          settingsInitialized = true;
+          if (!reactRoot) {
+            const pageVideo =
+              activeVideo ?? (document.querySelector('video') as HTMLVideoElement | null);
+            if (pageVideo) {
+              mountOverlayContainer(pageVideo);
+            }
+          }
         }
-      }
-      updatePlayerToggleButtonAppearance();
-      renderOverlayUI();
+        updatePlayerToggleButtonAppearance();
+        renderOverlayUI();
+      })();
     }
 
     async function handleInlineSettingsUpdate(patch: Partial<DubCeraSettings>): Promise<void> {
       currentSettings = await saveSettings(patch);
       syncNativeCcVisibility();
-      if (coordinator) {
-        await coordinator.updateSettings(currentSettings);
-      }
       updatePlayerToggleButtonAppearance();
       renderOverlayUI();
+      // When chrome.storage.onChanged is available, it applies coordinator.updateSettings once
+      // consistently across all tabs/frames without double-triggering.
+      if (!chrome.storage?.onChanged && coordinator) {
+        await coordinator.updateSettings(currentSettings);
+      }
     }
 
     function updatePlayerToggleButtonAppearance(): void {
@@ -224,9 +256,13 @@ export default defineContentScript({
 
     function ensurePlayerControlBarButton(): void {
       const ytRightControls = document.querySelector('.ytp-right-controls') as HTMLElement | null;
-      const udemyAnchor = ytRightControls ? null : findUdemyHorizontalRowAnchor();
+      const plyrControls = ytRightControls
+        ? null
+        : (document.querySelector('.plyr__controls') as HTMLElement | null);
+      const udemyAnchor =
+        ytRightControls || plyrControls ? null : findUdemyHorizontalRowAnchor();
 
-      const targetParent = ytRightControls ?? udemyAnchor?.row ?? null;
+      const targetParent = ytRightControls ?? plyrControls ?? udemyAnchor?.row ?? null;
       if (!targetParent) {
         if (playerToggleBtn && !playerToggleBtn.isConnected) {
           playerToggleBtn = null;
@@ -295,7 +331,15 @@ export default defineContentScript({
         togglePlayerSettingsPopover();
       });
 
-      const beforeEl = ytRightControls ? ytRightControls.firstChild : (udemyAnchor?.beforeNode ?? null);
+      const plyrBeforeEl = plyrControls
+        ? ((plyrControls.querySelector('[data-plyr="captions"], .plyr__menu, [data-plyr="fullscreen"]') as HTMLElement | null) ??
+          null)
+        : null;
+      const beforeEl = ytRightControls
+        ? ytRightControls.firstChild
+        : plyrControls
+          ? plyrBeforeEl
+          : (udemyAnchor?.beforeNode ?? null);
       targetParent.insertBefore(btn, beforeEl);
       playerToggleBtn = btn;
       updatePlayerToggleButtonAppearance();
@@ -330,7 +374,7 @@ export default defineContentScript({
           const el = ev.target as HTMLElement | null;
           if (
             el?.closest(
-              '.ytp-play-button, [data-purpose="play-button"], [data-purpose="pause-button"]',
+              '.ytp-play-button, [data-purpose="play-button"], [data-purpose="pause-button"], .plyr__control[data-plyr="play"]',
             )
           ) {
             coordinator.requestExplicitUserPause();
@@ -342,25 +386,20 @@ export default defineContentScript({
 
     function renderOverlayUI(): void {
       if (!reactRoot) return;
-      const showFallbackCornerPill = !playerToggleBtn || !playerToggleBtn.isConnected;
+      const showFallbackCornerPill =
+        isBunnyHost || !playerToggleBtn || !playerToggleBtn.isConnected;
       const { badgeText, accentColor } = computeBadgeVisuals();
+      const bunnyStatusText =
+        captionState === 'LOADING'
+          ? 'Đang lấy phụ đề tiếng Anh...'
+          : captionState === 'MISSING'
+            ? 'Không tìm thấy phụ đề tiếng Anh'
+            : (latestSnapshot?.statusBanner ?? 'Sẵn sàng');
 
       reactRoot.render(
         <React.StrictMode>
           {showFallbackCornerPill && (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                handleToggleClick();
-              }}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                togglePlayerSettingsPopover();
-              }}
-              title="Bấm để Bật/Tắt DubCera | Chuột phải mở Cài đặt Giọng đọc"
+            <div
               style={{
                 position: 'absolute',
                 top: '14px',
@@ -370,29 +409,121 @@ export default defineContentScript({
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: '6px',
-                padding: '4px 10px',
-                borderRadius: '8px',
-                background: 'rgba(15, 23, 42, 0.78)',
-                border: `1.5px solid ${accentColor}`,
-                color: '#F8FAFC',
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
-                fontSize: '11.5px',
-                fontWeight: 700,
-                cursor: 'pointer',
-                opacity: captionState === 'READY' && !latestSnapshot?.bufferingMessage ? 0.65 : 0.95,
+                maxWidth: 'calc(100% - 140px)',
               }}
             >
-              <span
-                style={{
-                  width: '7px',
-                  height: '7px',
-                  borderRadius: '50%',
-                  background: accentColor,
-                  display: 'inline-block',
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  handleToggleClick();
                 }}
-              />
-              <span>DC · {badgeText}</span>
-            </button>
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  togglePlayerSettingsPopover();
+                }}
+                title="Bấm để Bật/Tắt DubCera | Chuột phải mở Cài đặt Giọng đọc"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  padding: '5px 10px',
+                  borderRadius: '8px',
+                  background: 'rgba(15, 23, 42, 0.84)',
+                  border: `1.5px solid ${accentColor}`,
+                  color: '#F8FAFC',
+                  fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+                  fontSize: '11.5px',
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                <span
+                  style={{
+                    width: '7px',
+                    height: '7px',
+                    borderRadius: '50%',
+                    background: accentColor,
+                    display: 'inline-block',
+                  }}
+                />
+                <span>DC · {badgeText}</span>
+              </button>
+              {isBunnyHost && currentSettings.enabled && (
+                <div
+                  style={{
+                    padding: '5px 10px',
+                    borderRadius: '8px',
+                    background: 'rgba(15, 23, 42, 0.82)',
+                    border: '1px solid rgba(148, 163, 184, 0.35)',
+                    color: '#E2E8F0',
+                    fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+                    fontSize: '11.5px',
+                    fontWeight: 500,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {bunnyStatusText}
+                </div>
+              )}
+              {isBunnyHost && captionState === 'MISSING' && currentSettings.enabled && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    missingRetryCount = 0;
+                    captionState = 'IDLE';
+                    void tryAttachToPageVideo();
+                  }}
+                  style={{
+                    padding: '5px 9px',
+                    borderRadius: '8px',
+                    background: 'rgba(248, 113, 113, 0.22)',
+                    border: '1px solid rgba(248, 113, 113, 0.6)',
+                    color: '#FECACA',
+                    fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+                    fontSize: '11.5px',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  ↻ Thử lại
+                </button>
+              )}
+              {isBunnyHost && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    togglePlayerSettingsPopover();
+                  }}
+                  title="Mở Cài đặt Giọng đọc, Bộ dịch & Auto Theater"
+                  style={{
+                    padding: '5px 9px',
+                    borderRadius: '8px',
+                    background: settingsPopoverOpen
+                      ? 'rgba(14, 165, 233, 0.35)'
+                      : 'rgba(15, 23, 42, 0.84)',
+                    border: '1px solid rgba(56, 189, 248, 0.5)',
+                    color: '#E0F2FE',
+                    fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+                    fontSize: '12px',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  ⚙
+                </button>
+              )}
+            </div>
           )}
           <SubtitleOverlay
             chunk={currentSettings.enabled ? (latestSnapshot?.activeChunk ?? null) : null}
@@ -431,6 +562,7 @@ export default defineContentScript({
 
     function mountOverlayContainer(video: HTMLVideoElement): void {
       const container = (video.closest('.html5-video-player') ??
+        video.closest('.plyr') ??
         video.closest('[data-purpose="video-player"]') ??
         video.closest('[class*="video-player--container"]') ??
         video.parentElement) as HTMLElement | null;
@@ -538,7 +670,7 @@ export default defineContentScript({
 
     async function startCoordinatorWithCues(
       video: HTMLVideoElement,
-      platform: 'youtube' | 'udemy',
+      platform: 'youtube' | 'udemy' | 'bunny',
       videoId: string,
       cues: SubtitleCue[],
     ): Promise<void> {
@@ -557,6 +689,7 @@ export default defineContentScript({
         platform,
         videoId,
         handleCoordinatorSnapshot,
+        { prewarmOnPausedEntry: platform === 'bunny' },
       );
       await coordinator.initializeWithCues(cues);
     }
@@ -672,7 +805,11 @@ export default defineContentScript({
         return;
       }
 
-      const video = document.querySelector('video') as HTMLVideoElement | null;
+      const video = (
+        meta.platform === 'bunny'
+          ? (document.querySelector('video#main-video') ?? document.querySelector('video'))
+          : document.querySelector('video')
+      ) as HTMLVideoElement | null;
       if (!video) return;
 
       if (!currentSettings.enabled) {
@@ -713,6 +850,22 @@ export default defineContentScript({
             detail: { videoId: meta.videoId },
           }),
         );
+      } else if (meta.platform === 'bunny') {
+        captionState = 'LOADING';
+        updatePlayerToggleButtonAppearance();
+        renderOverlayUI();
+
+        const bunnyResult = await extractBunnyEnglishCues(video, fetchVttViaBackgroundOrDirect);
+        if (video !== activeVideo || meta.videoId !== activeVideoId || coordinator) {
+          return;
+        }
+        if (bunnyResult.cues.length > 0) {
+          await startCoordinatorWithCues(video, 'bunny', meta.videoId, bunnyResult.cues);
+        } else {
+          captionState = 'MISSING';
+          updatePlayerToggleButtonAppearance();
+          renderOverlayUI();
+        }
       } else {
         captionState = 'LOADING';
         updatePlayerToggleButtonAppearance();

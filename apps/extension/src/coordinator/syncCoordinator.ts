@@ -91,6 +91,8 @@ export class AdaptiveSyncCoordinator {
   private seekDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private pauseGraceTimer: ReturnType<typeof setTimeout> | null = null;
   private persistDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private prewarmTimer: ReturnType<typeof setInterval> | null = null;
+  private prewarmActive = false;
   private pauseGraceDeadlineMs = 0;
   private lastTimeUpdateWakeMs = 0;
   private hasPlayedInSession = false;
@@ -126,6 +128,7 @@ export class AdaptiveSyncCoordinator {
     private readonly platform: string,
     private readonly canonicalVideoId: string,
     private readonly onSnapshotChange: (snapshot: CoordinatorUiSnapshot) => void,
+    private readonly options: { prewarmOnPausedEntry?: boolean } = {},
   ) {
     this.ttsClient = new LocalTtsClient(
       settings.localTtsUrl,
@@ -225,6 +228,10 @@ export class AdaptiveSyncCoordinator {
       const alignedMs = this.alignPlayheadToSentenceStart();
       this.triggerBackgroundWorkers();
       void this.coordinateAtPlayhead(alignedMs);
+    } else if (this.settings.enabled && this.options.prewarmOnPausedEntry && this.segments.length > 0) {
+      // Pre-generate initial lookahead voice buffer while paused at 0s (e.g. FastTrack/Bunny)
+      this.updatePreviewChunkAtVideoMs(this.video.currentTime * 1000);
+      this.startPausedPrewarm();
     } else {
       // Video is paused on entry -> DO NOT start background translation/TTS until user presses Play!
       this.statusBanner = this.ttsDegradedSubtitleOnly
@@ -271,6 +278,7 @@ export class AdaptiveSyncCoordinator {
     if (!nextSettings.enabled) {
       // User turned DubCera OFF -> kill all background work & free memory immediately!
       this.pausedBookmark = null;
+      this.stopPausedPrewarm();
       this.clearPauseGraceTimer();
       this.abortBackgroundWorkImmediately();
       this.audioQueue.stopImmediate();
@@ -376,6 +384,7 @@ export class AdaptiveSyncCoordinator {
       this.persistDebounceTimer = null;
     }
     this.clearPauseGraceTimer();
+    this.stopPausedPrewarm();
     this.abortBackgroundWorkImmediately();
     this.detachVideoListeners();
     this.audioQueue.dispose();
@@ -438,14 +447,84 @@ export class AdaptiveSyncCoordinator {
     }
   }
 
+  private stopPausedPrewarm(): void {
+    this.prewarmActive = false;
+    if (this.prewarmTimer) {
+      clearInterval(this.prewarmTimer);
+      this.prewarmTimer = null;
+    }
+  }
+
+  private startPausedPrewarm(): void {
+    this.stopPausedPrewarm();
+    if (this.disposed || !this.settings.enabled || !this.video.paused || this.segments.length === 0) {
+      return;
+    }
+
+    const startIdx = Math.max(
+      0,
+      resolveSegmentIndexAtVideoTime(this.segments, this.video.currentTime * 1000),
+    );
+    const targetEndIdx = Math.min(this.segments.length, startIdx + TTS_LOOKAHEAD_COUNT);
+    const targetCount = Math.max(1, targetEndIdx - startIdx);
+
+    const countReadyInWindow = (): number => {
+      let count = 0;
+      for (let i = startIdx; i < targetEndIdx; i++) {
+        const seg = this.segments[i];
+        if (seg && (this.isSegmentPlayable(seg) || seg.status === 'ERROR')) {
+          count += 1;
+        }
+      }
+      return count;
+    };
+
+    const initialReady = countReadyInWindow();
+    if (initialReady >= targetCount) {
+      this.statusBanner = `Sẵn sàng phát ngay (${initialReady}/${this.segments.length} câu từ cache) — Bấm Play`;
+      this.emitSnapshot();
+      return;
+    }
+
+    this.prewarmActive = true;
+    this.statusBanner = `Đang chuẩn bị voice trước khi phát (${initialReady}/${targetCount})...`;
+    this.emitSnapshot();
+    this.triggerBackgroundWorkers();
+
+    const startedAt = performance.now();
+    this.prewarmTimer = setInterval(() => {
+      if (this.disposed || !this.settings.enabled || !this.video.paused || !this.prewarmActive) {
+        this.stopPausedPrewarm();
+        return;
+      }
+
+      const readyNow = countReadyInWindow();
+      const timedOut = performance.now() - startedAt > 25_000;
+      if (readyNow >= targetCount || timedOut) {
+        this.stopPausedPrewarm();
+        this.statusBanner =
+          readyNow > 0
+            ? `Sẵn sàng phát ngay (${readyNow}/${this.segments.length} câu đã chuẩn bị voice) — Bấm Play`
+            : `Sẵn sàng (${this.segments.length} câu) — Bấm Play để bắt đầu`;
+        this.emitSnapshot();
+        return;
+      }
+
+      this.statusBanner = `Đang chuẩn bị voice trước khi phát (${readyNow}/${targetCount})...`;
+      this.triggerBackgroundWorkers();
+      this.emitSnapshot();
+    }, 450);
+  }
+
   /**
    * Strict Gatekeeper: Returns true ONLY while actively playing, buffering for a Play request,
-   * or inside the 10-second post-Pause grace window!
+   * inside the bounded paused pre-warm window, or inside the 10-second post-Pause grace window!
    */
   private isBackgroundWorkAllowed(): boolean {
     if (this.disposed || !this.settings.enabled) return false;
     if (this.playbackState.isBuffering && this.playbackState.intent === 'PLAY') return true;
     if (!this.video.paused) return true;
+    if (this.prewarmActive && this.video.paused) return true;
     if (this.pauseGraceDeadlineMs > 0 && performance.now() < this.pauseGraceDeadlineMs) {
       return true;
     }
@@ -550,6 +629,7 @@ export class AdaptiveSyncCoordinator {
   private handleNativePlayEvent(): void {
     if (this.disposed || performance.now() < this.ignorePlayEventUntilMs) return;
     this.hasPlayedInSession = true;
+    this.stopPausedPrewarm();
     this.clearPauseGraceTimer();
     this.playbackState = recordUserPlayIntent(this.playbackState);
     if (!this.settings.enabled) return;
@@ -750,7 +830,7 @@ export class AdaptiveSyncCoordinator {
       this.refreshSegmentAudioKeysForCurrentMode();
     } else {
       try {
-        await this.ttsClient.checkHealth(1500);
+        await this.ttsClient.checkHealth(1500, true);
         this.useBuiltinTts = false;
         this.ttsDegradedSubtitleOnly = false;
         this.refreshSegmentAudioKeysForCurrentMode();
@@ -899,8 +979,9 @@ export class AdaptiveSyncCoordinator {
 
           if (this.disposed || signal.aborted) {
             for (const idx of batchIndices) {
-              if (!this.segments[idx]!.translatedText) {
-                this.segments[idx]!.status = 'UNPROCESSED';
+              const seg = this.segments[idx];
+              if (seg && !seg.translatedText) {
+                seg.status = 'UNPROCESSED';
               }
             }
             break;
@@ -931,15 +1012,19 @@ export class AdaptiveSyncCoordinator {
         } catch (err) {
           if (this.disposed || signal.aborted || !this.isBackgroundWorkAllowed()) {
             for (const idx of batchIndices) {
-              if (!this.segments[idx]!.translatedText) {
-                this.segments[idx]!.status = 'UNPROCESSED';
+              const seg = this.segments[idx];
+              if (seg && !seg.translatedText) {
+                seg.status = 'UNPROCESSED';
               }
             }
             break;
           }
           for (const idx of batchIndices) {
-            this.segments[idx]!.status = 'ERROR';
-            this.segments[idx]!.errorMessage = err instanceof Error ? err.message : 'Lỗi dịch';
+            const seg = this.segments[idx];
+            if (seg) {
+              seg.status = 'ERROR';
+              seg.errorMessage = err instanceof Error ? err.message : 'Lỗi dịch';
+            }
           }
           this.emitSnapshot();
           await new Promise((r) => setTimeout(r, 1200));

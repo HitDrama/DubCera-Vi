@@ -49,6 +49,19 @@ export default defineContentScript({
     let latestSnapshot: CoordinatorUiSnapshot | null = null;
     let captionState: 'IDLE' | 'LOADING' | 'READY' | 'MISSING' = 'IDLE';
     let missingRetryCount = 0;
+    let shortcutHudText: string | null = null;
+    let shortcutHudTimer: ReturnType<typeof setTimeout> | null = null;
+
+    function showShortcutHud(text: string): void {
+      shortcutHudText = text;
+      if (shortcutHudTimer) clearTimeout(shortcutHudTimer);
+      shortcutHudTimer = setTimeout(() => {
+        shortcutHudText = null;
+        shortcutHudTimer = null;
+        renderOverlayUI();
+      }, 750);
+      renderOverlayUI();
+    }
 
     // Hide default YouTube & Udemy native caption boxes while DubCera overlay is active so two subtitle boxes never collide
     const hideNativeCcStyle = document.createElement('style');
@@ -346,26 +359,126 @@ export default defineContentScript({
     }
 
     // Capture-phase guard for YouTube & Udemy external pause controls (`Space` / `K` / Play-Pause button)
+    // Plus dedicated deterministic Space (Play/Pause) & Left/Right (±10s) shortcuts for Bunny/FastTrack
+    function executeBunnyPlayerCommand(
+      action: 'toggle-play' | 'seek-by',
+      deltaSec = 0,
+    ): void {
+      const video =
+        activeVideo ??
+        (document.querySelector('video#main-video') as HTMLVideoElement | null) ??
+        (document.querySelector('video') as HTMLVideoElement | null);
+      if (!video) return;
+
+      if (action === 'toggle-play') {
+        if (coordinator && latestSnapshot?.playbackState.isBuffering) {
+          coordinator.requestExplicitUserPause();
+          showShortcutHud('⏸ Tạm dừng');
+          return;
+        }
+        if (video.paused) {
+          void video.play().catch(() => {});
+          showShortcutHud('▶ Phát');
+        } else {
+          video.pause();
+          showShortcutHud('⏸ Tạm dừng');
+        }
+        return;
+      }
+
+      if (action === 'seek-by' && Number.isFinite(deltaSec) && deltaSec !== 0) {
+        const duration =
+          Number.isFinite(video.duration) && video.duration > 0
+            ? video.duration
+            : Number.MAX_SAFE_INTEGER;
+        const nextTime = Math.max(0, Math.min(duration, video.currentTime + deltaSec));
+        video.currentTime = nextTime;
+        showShortcutHud(deltaSec < 0 ? `⏪ ${deltaSec}s` : `⏩ +${deltaSec}s`);
+      }
+    }
+
     function setupExternalControlsCapture(): void {
       window.addEventListener(
         'keydown',
         (ev) => {
-          if (!coordinator || !latestSnapshot?.playbackState.isBuffering) return;
           const target = ev.target as HTMLElement | null;
           if (
             target &&
             (target.tagName === 'INPUT' ||
               target.tagName === 'TEXTAREA' ||
+              target.tagName === 'SELECT' ||
               target.isContentEditable)
           ) {
             return;
           }
+
+          if (isBunnyHost) {
+            if (ev.key === 'Escape' && window !== window.top) {
+              ev.preventDefault();
+              ev.stopPropagation();
+              ev.stopImmediatePropagation();
+              window.parent.postMessage(
+                { source: 'dubcera-bunny', type: 'DUBCERA_EXIT_THEATER' },
+                '*',
+              );
+              return;
+            }
+            if (ev.ctrlKey || ev.altKey || ev.metaKey) return;
+
+            if (ev.code === 'Space' || ev.key === ' ') {
+              ev.preventDefault();
+              ev.stopPropagation();
+              ev.stopImmediatePropagation();
+              executeBunnyPlayerCommand('toggle-play');
+              return;
+            }
+            if (ev.key === 'ArrowLeft') {
+              ev.preventDefault();
+              ev.stopPropagation();
+              ev.stopImmediatePropagation();
+              executeBunnyPlayerCommand('seek-by', -10);
+              return;
+            }
+            if (ev.key === 'ArrowRight') {
+              ev.preventDefault();
+              ev.stopPropagation();
+              ev.stopImmediatePropagation();
+              executeBunnyPlayerCommand('seek-by', 10);
+              return;
+            }
+            return;
+          }
+
+          if (!coordinator || !latestSnapshot?.playbackState.isBuffering) return;
           if (ev.code === 'Space' || ev.key.toLowerCase() === 'k') {
             coordinator.requestExplicitUserPause();
           }
         },
         true,
       );
+
+      if (isBunnyHost) {
+        window.addEventListener('message', (ev: MessageEvent) => {
+          if (
+            ev.origin !== 'https://fasttracktutorials.com' &&
+            ev.origin !== 'https://www.fasttracktutorials.com'
+          ) {
+            return;
+          }
+          const data = ev.data as {
+            source?: string;
+            type?: string;
+            action?: 'toggle-play' | 'seek-by';
+            deltaSec?: number;
+          } | null;
+          if (data?.source !== 'dubcera-fasttrack' || data.type !== 'DUBCERA_PLAYER_CMD') {
+            return;
+          }
+          if (data.action === 'toggle-play' || data.action === 'seek-by') {
+            executeBunnyPlayerCommand(data.action, data.deltaSec ?? 0);
+          }
+        });
+      }
 
       window.addEventListener(
         'click',
@@ -523,6 +636,30 @@ export default defineContentScript({
                   ⚙
                 </button>
               )}
+            </div>
+          )}
+          {shortcutHudText && (
+            <div
+              style={{
+                position: 'absolute',
+                top: '18%',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                zIndex: 2147483645,
+                pointerEvents: 'none',
+                padding: '7px 16px',
+                borderRadius: '10px',
+                background: 'rgba(15, 23, 42, 0.86)',
+                border: '1px solid rgba(56, 189, 248, 0.5)',
+                color: '#F8FAFC',
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+                fontSize: '15px',
+                fontWeight: 700,
+                letterSpacing: '0.02em',
+                boxShadow: '0 8px 24px rgba(0, 0, 0, 0.45)',
+              }}
+            >
+              {shortcutHudText}
             </div>
           )}
           <SubtitleOverlay

@@ -745,10 +745,14 @@ export class AdaptiveSyncCoordinator {
       const idx = resolveSegmentIndexAtVideoTime(this.segments, alignedMs);
 
       if (!this.video.paused || (this.wasPlayingBeforeScrub && this.playbackState.intent === 'PLAY')) {
+        const needsResume = this.video.paused;
         this.wasPlayingBeforeScrub = false;
         this.hasPlayedInSession = true;
         this.clearPauseGraceTimer();
         this.playbackState = recordUserPlayIntent(this.playbackState);
+        if (needsResume) {
+          void this.programmaticPlayVideo();
+        }
         this.triggerBackgroundWorkers();
         void this.coordinateAtPlayhead(alignedMs);
       } else {

@@ -176,13 +176,74 @@ export class FastTrackTheaterController {
 
   private readonly boundKeydown: (ev: KeyboardEvent) => void;
   private readonly boundDocumentClick: (ev: MouseEvent) => void;
+  private readonly boundWindowMessage: (ev: MessageEvent) => void;
 
   constructor(private readonly doc: Document = document) {
+    this.boundWindowMessage = (ev: MessageEvent) => {
+      if (ev.origin !== 'https://iframe.mediadelivery.net') return;
+      const data = ev.data as { source?: string; type?: string } | null;
+      if (data?.source === 'dubcera-bunny' && data.type === 'DUBCERA_EXIT_THEATER') {
+        if (this.activePopup) {
+          this.exitTheater(true);
+        }
+      }
+    };
+
     this.boundKeydown = (ev: KeyboardEvent) => {
+      const target = ev.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+
       if (ev.key === 'Escape' && this.activePopup) {
         ev.preventDefault();
         ev.stopPropagation();
         this.exitTheater(true);
+        return;
+      }
+
+      if (ev.ctrlKey || ev.altKey || ev.metaKey) return;
+
+      const active = findActiveFastTrackBunnyPopup(this.doc);
+      if (!active?.iframe.contentWindow) return;
+
+      if (ev.code === 'Space' || ev.key === ' ') {
+        ev.preventDefault();
+        ev.stopPropagation();
+        active.iframe.contentWindow.postMessage(
+          { source: 'dubcera-fasttrack', type: 'DUBCERA_PLAYER_CMD', action: 'toggle-play' },
+          'https://iframe.mediadelivery.net',
+        );
+      } else if (ev.key === 'ArrowLeft') {
+        ev.preventDefault();
+        ev.stopPropagation();
+        active.iframe.contentWindow.postMessage(
+          {
+            source: 'dubcera-fasttrack',
+            type: 'DUBCERA_PLAYER_CMD',
+            action: 'seek-by',
+            deltaSec: -10,
+          },
+          'https://iframe.mediadelivery.net',
+        );
+      } else if (ev.key === 'ArrowRight') {
+        ev.preventDefault();
+        ev.stopPropagation();
+        active.iframe.contentWindow.postMessage(
+          {
+            source: 'dubcera-fasttrack',
+            type: 'DUBCERA_PLAYER_CMD',
+            action: 'seek-by',
+            deltaSec: 10,
+          },
+          'https://iframe.mediadelivery.net',
+        );
       }
     };
 
@@ -212,6 +273,7 @@ export class FastTrackTheaterController {
 
     this.doc.addEventListener('keydown', this.boundKeydown, true);
     this.doc.addEventListener('click', this.boundDocumentClick, true);
+    window.addEventListener('message', this.boundWindowMessage);
 
     this.observer = new MutationObserver(() => {
       this.scheduleSync(60);
@@ -353,6 +415,7 @@ export class FastTrackTheaterController {
     this.observer = null;
     this.doc.removeEventListener('keydown', this.boundKeydown, true);
     this.doc.removeEventListener('click', this.boundDocumentClick, true);
+    window.removeEventListener('message', this.boundWindowMessage);
     this.exitTheater(false);
     this.removeExpandButton();
   }

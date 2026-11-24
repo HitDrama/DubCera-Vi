@@ -25,11 +25,12 @@ export default defineContentScript({
     '*://*.youtube.com/*',
     '*://*.udemy.com/*',
     '*://iframe.mediadelivery.net/*',
+    '*://*.thegnomonworkshop.com/*',
   ],
   allFrames: true,
   runAt: 'document_idle',
   main() {
-    // YouTube & Udemy run strictly in top frame; Bunny Stream runs inside its embed iframe
+    // YouTube, Udemy & The Gnomon Workshop run strictly in top frame; Bunny Stream runs inside its embed iframe
     const initialHost = location.hostname.toLowerCase();
     const isBunnyHost = initialHost === 'iframe.mediadelivery.net';
     if (!isBunnyHost && window !== window.top) {
@@ -37,6 +38,7 @@ export default defineContentScript({
     }
     let activeVideo: HTMLVideoElement | null = null;
     let activeVideoId = '';
+    let latestGnomonEntryId = '';
     let coordinator: AdaptiveSyncCoordinator | null = null;
     let shadowHost: HTMLDivElement | null = null;
     let reactRoot: Root | null = null;
@@ -51,6 +53,79 @@ export default defineContentScript({
     let missingRetryCount = 0;
     let shortcutHudText: string | null = null;
     let shortcutHudTimer: ReturnType<typeof setTimeout> | null = null;
+    const CORNER_BAR_POS_KEY = 'dubcera_corner_bar_pos_v1';
+    let cornerBarPos: { x: number; y: number } = (() => {
+      try {
+        const raw = localStorage.getItem(CORNER_BAR_POS_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as { x?: number; y?: number };
+          if (typeof parsed.x === 'number' && typeof parsed.y === 'number') {
+            return { x: Math.max(8, parsed.x), y: Math.max(8, parsed.y) };
+          }
+        }
+      } catch {
+        // Ignore restricted storage
+      }
+      return { x: 16, y: 14 };
+    })();
+    let cornerBarDragging = false;
+    let cornerBarCollapsed = false;
+
+    function clampCornerBarPos(x: number, y: number, barEl: HTMLElement | null): { x: number; y: number } {
+      const hostRect = shadowHost?.getBoundingClientRect();
+      const barRect = barEl?.getBoundingClientRect();
+      const maxX = hostRect
+        ? Math.max(8, hostRect.width - (barRect?.width ?? 180) - 8)
+        : Math.max(8, window.innerWidth - 200);
+      const maxY = hostRect
+        ? Math.max(8, hostRect.height - (barRect?.height ?? 36) - 8)
+        : Math.max(8, window.innerHeight - 44);
+      return {
+        x: Math.round(Math.max(8, Math.min(maxX, x))),
+        y: Math.round(Math.max(8, Math.min(maxY, y))),
+      };
+    }
+
+    function startCornerBarDrag(ev: React.PointerEvent<HTMLElement>): void {
+      if (ev.button !== 0) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+
+      const barEl = ev.currentTarget.closest('[data-dc-corner-bar="1"]') as HTMLElement | null;
+      const startClientX = ev.clientX;
+      const startClientY = ev.clientY;
+      const originX = cornerBarPos.x;
+      const originY = cornerBarPos.y;
+      cornerBarDragging = true;
+      renderOverlayUI();
+
+      const onMove = (moveEv: PointerEvent) => {
+        const dx = moveEv.clientX - startClientX;
+        const dy = moveEv.clientY - startClientY;
+        cornerBarPos = clampCornerBarPos(originX + dx, originY + dy, barEl);
+        if (barEl) {
+          barEl.style.left = `${cornerBarPos.x}px`;
+          barEl.style.top = `${cornerBarPos.y}px`;
+        }
+      };
+
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onUp);
+        cornerBarDragging = false;
+        try {
+          localStorage.setItem(CORNER_BAR_POS_KEY, JSON.stringify(cornerBarPos));
+        } catch {
+          // Ignore storage quota errors
+        }
+        renderOverlayUI();
+      };
+
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onUp);
+    }
 
     function showShortcutHud(text: string): void {
       shortcutHudText = text;
@@ -81,7 +156,8 @@ export default defineContentScript({
             '[class*="captions-display--captions-cue-text"],',
             '.shaka-text-container,',
             '.vjs-text-track-display,',
-            '.plyr__captions {',
+            '.plyr__captions,',
+            '.playkit-subtitles {',
             '  opacity: 0 !important;',
             '  pointer-events: none !important;',
             '}',
@@ -89,7 +165,10 @@ export default defineContentScript({
         : '';
     }
 
-    function resolvePlatformAndVideoId(): { platform: 'youtube' | 'udemy' | 'bunny'; videoId: string } | null {
+    function resolvePlatformAndVideoId(): {
+      platform: 'youtube' | 'udemy' | 'bunny' | 'gnomon';
+      videoId: string;
+    } | null {
       const host = location.hostname.toLowerCase();
       if (host.includes('youtube.com')) {
         const url = new URL(location.href);
@@ -110,6 +189,19 @@ export default defineContentScript({
         const bunnyId = parseBunnyEmbedVideoId(location.href);
         if (bunnyId) {
           return { platform: 'bunny', videoId: bunnyId };
+        }
+        return null;
+      }
+      if (host.includes('thegnomonworkshop.com')) {
+        if (latestGnomonEntryId) {
+          return { platform: 'gnomon', videoId: latestGnomonEntryId };
+        }
+        const playkitLabel = document
+          .querySelector('.playkit-video-player')
+          ?.getAttribute('aria-label')
+          ?.trim();
+        if (playkitLabel) {
+          return { platform: 'gnomon', videoId: `${location.pathname}::${playkitLabel}` };
         }
         return null;
       }
@@ -272,10 +364,17 @@ export default defineContentScript({
       const plyrControls = ytRightControls
         ? null
         : (document.querySelector('.plyr__controls') as HTMLElement | null);
+      const playkitRightControls =
+        ytRightControls || plyrControls
+          ? null
+          : (document.querySelector('.playkit-right-controls') as HTMLElement | null);
       const udemyAnchor =
-        ytRightControls || plyrControls ? null : findUdemyHorizontalRowAnchor();
+        ytRightControls || plyrControls || playkitRightControls
+          ? null
+          : findUdemyHorizontalRowAnchor();
 
-      const targetParent = ytRightControls ?? plyrControls ?? udemyAnchor?.row ?? null;
+      const targetParent =
+        ytRightControls ?? plyrControls ?? playkitRightControls ?? udemyAnchor?.row ?? null;
       if (!targetParent) {
         if (playerToggleBtn && !playerToggleBtn.isConnected) {
           playerToggleBtn = null;
@@ -348,11 +447,17 @@ export default defineContentScript({
         ? ((plyrControls.querySelector('[data-plyr="captions"], .plyr__menu, [data-plyr="fullscreen"]') as HTMLElement | null) ??
           null)
         : null;
+      const playkitBeforeEl = playkitRightControls
+        ? ((playkitRightControls.querySelector('.playkit-control-captions-control, .playkit-control-fullscreen') as HTMLElement | null) ??
+          playkitRightControls.firstChild)
+        : null;
       const beforeEl = ytRightControls
         ? ytRightControls.firstChild
         : plyrControls
           ? plyrBeforeEl
-          : (udemyAnchor?.beforeNode ?? null);
+          : playkitRightControls
+            ? playkitBeforeEl
+            : (udemyAnchor?.beforeNode ?? null);
       targetParent.insertBefore(btn, beforeEl);
       playerToggleBtn = btn;
       updatePlayerToggleButtonAppearance();
@@ -487,7 +592,7 @@ export default defineContentScript({
           const el = ev.target as HTMLElement | null;
           if (
             el?.closest(
-              '.ytp-play-button, [data-purpose="play-button"], [data-purpose="pause-button"], .plyr__control[data-plyr="play"]',
+              '.ytp-play-button, [data-purpose="play-button"], [data-purpose="pause-button"], .plyr__control[data-plyr="play"], .playkit-control-play-pause button',
             )
           ) {
             coordinator.requestExplicitUserPause();
@@ -513,18 +618,53 @@ export default defineContentScript({
         <React.StrictMode>
           {showFallbackCornerPill && (
             <div
+              data-dc-corner-bar="1"
+              onClick={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
               style={{
                 position: 'absolute',
-                top: '14px',
-                left: '16px',
+                top: `${cornerBarPos.y}px`,
+                left: `${cornerBarPos.x}px`,
                 zIndex: 2147483644,
                 pointerEvents: 'auto',
                 display: 'inline-flex',
                 alignItems: 'center',
-                gap: '6px',
-                maxWidth: 'calc(100% - 140px)',
+                gap: '5px',
+                maxWidth: 'calc(100% - 24px)',
+                userSelect: 'none',
+                touchAction: 'none',
               }}
             >
+              <span
+                onPointerDown={startCornerBarDrag}
+                onDoubleClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  cornerBarPos = { x: 16, y: 14 };
+                  try {
+                    localStorage.setItem(CORNER_BAR_POS_KEY, JSON.stringify(cornerBarPos));
+                  } catch {
+                    // Ignore
+                  }
+                  renderOverlayUI();
+                }}
+                title="Giữ và kéo để di chuyển thanh DubCera | Nháy đúp để về góc trên-trái"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: '5px 6px',
+                  borderRadius: '8px',
+                  background: 'rgba(15, 23, 42, 0.84)',
+                  border: '1px solid rgba(148, 163, 184, 0.4)',
+                  color: '#94A3B8',
+                  fontSize: '12px',
+                  lineHeight: 1,
+                  cursor: cornerBarDragging ? 'grabbing' : 'grab',
+                }}
+              >
+                ⋮⋮
+              </span>
               <button
                 type="button"
                 onClick={(e) => {
@@ -565,8 +705,10 @@ export default defineContentScript({
                 />
                 <span>DC · {badgeText}</span>
               </button>
-              {isBunnyHost && currentSettings.enabled && (
+              {isBunnyHost && currentSettings.enabled && !cornerBarCollapsed && (
                 <div
+                  onPointerDown={startCornerBarDrag}
+                  title="Giữ và kéo để di chuyển"
                   style={{
                     padding: '5px 10px',
                     borderRadius: '8px',
@@ -579,10 +721,36 @@ export default defineContentScript({
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
                     whiteSpace: 'nowrap',
+                    cursor: cornerBarDragging ? 'grabbing' : 'grab',
                   }}
                 >
                   {bunnyStatusText}
                 </div>
+              )}
+              {isBunnyHost && currentSettings.enabled && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    cornerBarCollapsed = !cornerBarCollapsed;
+                    renderOverlayUI();
+                  }}
+                  title={cornerBarCollapsed ? 'Hiện dòng trạng thái' : 'Thu gọn dòng trạng thái'}
+                  style={{
+                    padding: '5px 7px',
+                    borderRadius: '8px',
+                    background: 'rgba(15, 23, 42, 0.84)',
+                    border: '1px solid rgba(148, 163, 184, 0.4)',
+                    color: '#CBD5E1',
+                    fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+                    fontSize: '11.5px',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {cornerBarCollapsed ? '›' : '‹'}
+                </button>
               )}
               {isBunnyHost && captionState === 'MISSING' && currentSettings.enabled && (
                 <button
@@ -700,6 +868,8 @@ export default defineContentScript({
     function mountOverlayContainer(video: HTMLVideoElement): void {
       const container = (video.closest('.html5-video-player') ??
         video.closest('.plyr') ??
+        video.closest('.playkit-player') ??
+        video.closest('.kaltura-player-container') ??
         video.closest('[data-purpose="video-player"]') ??
         video.closest('[class*="video-player--container"]') ??
         video.parentElement) as HTMLElement | null;
@@ -807,7 +977,7 @@ export default defineContentScript({
 
     async function startCoordinatorWithCues(
       video: HTMLVideoElement,
-      platform: 'youtube' | 'udemy' | 'bunny',
+      platform: 'youtube' | 'udemy' | 'bunny' | 'gnomon',
       videoId: string,
       cues: SubtitleCue[],
     ): Promise<void> {
@@ -826,7 +996,7 @@ export default defineContentScript({
         platform,
         videoId,
         handleCoordinatorSnapshot,
-        { prewarmOnPausedEntry: platform === 'bunny' },
+        { prewarmOnPausedEntry: platform === 'bunny' || platform === 'gnomon' },
       );
       await coordinator.initializeWithCues(cues);
     }
@@ -906,6 +1076,67 @@ export default defineContentScript({
         }
 
         await startCoordinatorWithCues(targetVideo, 'udemy', targetVideoId, cues);
+      })();
+    });
+
+    // 3. Listen for The Gnomon Workshop (Kaltura) lesson switches & WebVTT caption responses
+    window.addEventListener('dubcera:gnomon-lesson-ready', (ev: Event) => {
+      const customEv = ev as CustomEvent<{ entryId?: string }>;
+      const entryId = customEv.detail?.entryId?.trim();
+      if (!entryId) return;
+      if (entryId !== latestGnomonEntryId) {
+        latestGnomonEntryId = entryId;
+        missingRetryCount = 0;
+        void tryAttachToPageVideo();
+      }
+    });
+
+    window.addEventListener('dubcera:gnomon-captions-result', (ev: Event) => {
+      const customEv = ev as CustomEvent<{
+        videoId?: string;
+        ok?: boolean;
+        vttText?: string;
+        vttUrl?: string;
+      }>;
+      const detail = customEv.detail;
+      if (!detail || !detail.videoId) return;
+      if (detail.videoId !== activeVideoId || !activeVideo) return;
+      if (coordinator) return;
+
+      const targetVideo = activeVideo;
+      const targetVideoId = detail.videoId;
+
+      void (async () => {
+        if (!detail.ok) {
+          captionState = 'MISSING';
+          updatePlayerToggleButtonAppearance();
+          renderOverlayUI();
+          return;
+        }
+
+        let rawVtt = detail.vttText ?? null;
+        if (!rawVtt && detail.vttUrl) {
+          rawVtt = await fetchVttViaBackgroundOrDirect(detail.vttUrl);
+        }
+
+        if (!rawVtt || targetVideo !== activeVideo || targetVideoId !== activeVideoId || coordinator) {
+          if (!coordinator && targetVideoId === activeVideoId) {
+            captionState = 'MISSING';
+            updatePlayerToggleButtonAppearance();
+            renderOverlayUI();
+          }
+          return;
+        }
+
+        const cues = parseVtt(rawVtt);
+        if (cues.length === 0) {
+          captionState = 'MISSING';
+          updatePlayerToggleButtonAppearance();
+          renderOverlayUI();
+          return;
+        }
+
+        await startCoordinatorWithCues(targetVideo, 'gnomon', targetVideoId, cues);
       })();
     });
 
@@ -1002,6 +1233,24 @@ export default defineContentScript({
           captionState = 'MISSING';
           updatePlayerToggleButtonAppearance();
           renderOverlayUI();
+        }
+      } else if (meta.platform === 'gnomon') {
+        captionState = 'LOADING';
+        updatePlayerToggleButtonAppearance();
+        renderOverlayUI();
+
+        const domCues = await extractStandardHtml5Cues(video);
+        if (video !== activeVideo || meta.videoId !== activeVideoId || coordinator) {
+          return;
+        }
+        if (domCues.length > 0) {
+          await startCoordinatorWithCues(video, 'gnomon', meta.videoId, domCues);
+        } else {
+          window.dispatchEvent(
+            new CustomEvent('dubcera:request-gnomon-captions', {
+              detail: { videoId: meta.videoId },
+            }),
+          );
         }
       } else {
         captionState = 'LOADING';

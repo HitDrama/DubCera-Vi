@@ -547,7 +547,9 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
           host === 'udemy.com' ||
           host.endsWith('.youtube.com') ||
           host === 'iframe.mediadelivery.net' ||
-          host.endsWith('.b-cdn.net'));
+          host.endsWith('.b-cdn.net') ||
+          host.endsWith('.kaltura.com') ||
+          host.endsWith('.thegnomonworkshop.com'));
       if (!isAllowedSubtitleHost) {
         throw new Error(`Disallowed subtitle host: ${host}`);
       }

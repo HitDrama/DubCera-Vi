@@ -274,11 +274,12 @@ export const PlayerSettingsPopover: React.FC<PlayerSettingsPopoverProps> = ({
 
         {settings.translationProvider !== 'free-web' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '5px', marginTop: '6px' }}>
-            <input
-              type="password"
-              placeholder="Dán API Key vào đây..."
+            <textarea
+              rows={2}
+              placeholder="Dán 1 hoặc nhiều API Key (mỗi dòng 1 key)..."
               value={apiKeyDraft}
               onChange={(e) => setApiKeyDraft(e.target.value)}
+              spellCheck={false}
               style={{
                 width: '100%',
                 boxSizing: 'border-box',
@@ -287,7 +288,9 @@ export const PlayerSettingsPopover: React.FC<PlayerSettingsPopoverProps> = ({
                 background: '#1E293B',
                 color: '#F8FAFC',
                 border: '1px solid #475569',
-                fontSize: '11.5px',
+                fontSize: '11px',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                resize: 'vertical',
               }}
             />
             <div style={{ display: 'flex', gap: '5px' }}>

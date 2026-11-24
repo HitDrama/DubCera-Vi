@@ -1,6 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import type { SubtitleDisplayMode, SyncMode } from '@dubcera/core';
+import { sendBackgroundRpc } from '../../src/bridges/extensionRpc';
 import { clearAllBuiltinAudioCache } from '../../src/storage/builtinAudioCacheDb';
+import {
+  LLM_STATUS_STORAGE_KEY,
+  type LlmTranslationStatus,
+} from '../../src/translation/llmApiProvider';
 import { clearAllVideoManifests } from '../../src/storage/manifestDb';
 import {
   DEFAULT_MODEL_BY_PROVIDER,
@@ -34,6 +39,8 @@ export const App: React.FC = () => {
   const [modelDraft, setModelDraft] = useState(DEFAULT_MODEL_BY_PROVIDER.gemini);
   const [endpointDraft, setEndpointDraft] = useState('https://api.openai.com/v1/chat/completions');
   const [aiSavedNotice, setAiSavedNotice] = useState<string | null>(null);
+  const [testingAi, setTestingAi] = useState(false);
+  const [llmStatus, setLlmStatus] = useState<LlmTranslationStatus | null>(null);
   const [voices, setVoices] = useState<LocalVoiceOption[]>([]);
   const [serverOnline, setServerOnline] = useState<boolean | null>(null);
   const [copiedCmd, setCopiedCmd] = useState(false);
@@ -58,6 +65,12 @@ export const App: React.FC = () => {
       setApiKeyDraft(loaded.llmApiKey);
       setModelDraft(loaded.llmModel || DEFAULT_MODEL_BY_PROVIDER[loaded.translationProvider]);
       setEndpointDraft(loaded.llmEndpointUrl);
+      try {
+        const st = await chrome.storage?.local?.get(LLM_STATUS_STORAGE_KEY);
+        setLlmStatus((st?.[LLM_STATUS_STORAGE_KEY] as LlmTranslationStatus | undefined) ?? null);
+      } catch {
+        // Ignore
+      }
       if (alsoCheckServer) {
         await checkLocalServer(loaded);
       }
@@ -100,6 +113,41 @@ export const App: React.FC = () => {
         ? 'Đã lưu cấu hình Dịch AI Ngữ Cảnh — Đang áp dụng ngay trên video!'
         : 'Chưa có API Key — Hệ thống sẽ tự dùng Dịch Thông Minh Miễn Phí.',
     );
+  };
+
+  const handleTestAiConfig = async () => {
+    if (testingAi || settings.translationProvider === 'free-web') return;
+    const key = apiKeyDraft.trim();
+    const model = modelDraft.trim() || DEFAULT_MODEL_BY_PROVIDER[settings.translationProvider];
+    const endpointUrl = endpointDraft.trim() || 'https://api.openai.com/v1/chat/completions';
+    if (!key) {
+      setAiSavedNotice('Chưa nhập API Key để kiểm tra.');
+      return;
+    }
+    setTestingAi(true);
+    setAiSavedNotice(`Đang test ${settings.translationProvider}/${model}...`);
+    const t0 = performance.now();
+    try {
+      const raw = await sendBackgroundRpc<string>({
+        type: 'AI_LLM_TRANSLATE',
+        provider: settings.translationProvider,
+        endpointUrl,
+        apiKey: key,
+        model,
+        systemPrompt:
+          'Translate to natural spoken Vietnamese. Return ONLY JSON: {"translatedText":"..."}',
+        userPayload: JSON.stringify({
+          sourceText: "So in this video we're going to start the blockout.",
+        }),
+      });
+      const ms = Math.round(performance.now() - t0);
+      setAiSavedNotice(`✓ Kết nối thành công (${ms}ms): ${raw.slice(0, 120)}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setAiSavedNotice(`✗ Lỗi API (${model}): ${msg}`);
+    } finally {
+      setTestingAi(false);
+    }
   };
 
   const handleCopyStartCmd = () => {
@@ -433,11 +481,12 @@ export const App: React.FC = () => {
               )}
             </div>
 
-            <input
-              type="password"
-              placeholder="Dán API Key vào đây..."
+            <textarea
+              rows={3}
+              placeholder="Dán 1 hoặc nhiều API Key (mỗi dòng 1 key: Key 1 → Key 2 → Key 3 tự xoay vòng khi lỗi)..."
               value={apiKeyDraft}
               onChange={(e) => setApiKeyDraft(e.target.value)}
+              spellCheck={false}
               style={{
                 width: '100%',
                 boxSizing: 'border-box',
@@ -446,9 +495,23 @@ export const App: React.FC = () => {
                 background: '#1E293B',
                 color: '#F8FAFC',
                 border: '1px solid #475569',
-                fontSize: '12px',
+                fontSize: '11.5px',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                resize: 'vertical',
               }}
             />
+            <div style={{ fontSize: '10.5px', color: '#94A3B8' }}>
+              Đã nhập{' '}
+              <b style={{ color: '#38BDF8' }}>
+                {
+                  apiKeyDraft
+                    .split(/[\r\n,;]+/)
+                    .map((k) => k.trim())
+                    .filter(Boolean).length
+                }
+              </b>{' '}
+              key (tự đổi Key 1 → Key 2 → Key 3; hết key mới về dịch miễn phí)
+            </div>
 
             {settings.translationProvider === 'openai-compatible' && (
               <input
@@ -488,6 +551,23 @@ export const App: React.FC = () => {
               />
               <button
                 type="button"
+                onClick={() => void handleTestAiConfig()}
+                disabled={testingAi}
+                style={{
+                  padding: '6px 10px',
+                  borderRadius: '6px',
+                  border: '1px solid #38BDF8',
+                  background: 'rgba(56, 189, 248, 0.16)',
+                  color: '#BAE6FD',
+                  fontWeight: 700,
+                  fontSize: '12px',
+                  cursor: testingAi ? 'wait' : 'pointer',
+                }}
+              >
+                {testingAi ? '...' : 'Test'}
+              </button>
+              <button
+                type="button"
                 onClick={() => void handleSaveAiConfig()}
                 style={{
                   padding: '6px 12px',
@@ -505,8 +585,37 @@ export const App: React.FC = () => {
             </div>
 
             {aiSavedNotice && (
-              <div style={{ fontSize: '11px', color: '#6EE7B7', lineHeight: 1.35 }}>
+              <div
+                style={{
+                  fontSize: '11px',
+                  color: aiSavedNotice.startsWith('✗') ? '#FCA5A5' : '#6EE7B7',
+                  lineHeight: 1.35,
+                  wordBreak: 'break-word',
+                }}
+              >
                 {aiSavedNotice}
+              </div>
+            )}
+
+            {llmStatus && (
+              <div
+                style={{
+                  padding: '5px 7px',
+                  borderRadius: '5px',
+                  fontSize: '11px',
+                  lineHeight: 1.35,
+                  wordBreak: 'break-word',
+                  background: llmStatus.ok
+                    ? 'rgba(16, 185, 129, 0.12)'
+                    : 'rgba(239, 68, 68, 0.14)',
+                  border: llmStatus.ok
+                    ? '1px solid rgba(16, 185, 129, 0.35)'
+                    : '1px solid rgba(248, 113, 113, 0.45)',
+                  color: llmStatus.ok ? '#A7F3D0' : '#FECACA',
+                }}
+              >
+                {llmStatus.ok ? '✓ ' : '⚠ '}
+                {llmStatus.detail}
               </div>
             )}
           </div>

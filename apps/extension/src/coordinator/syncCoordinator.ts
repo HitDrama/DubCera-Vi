@@ -247,6 +247,7 @@ export class AdaptiveSyncCoordinator {
 
   public async updateSettings(nextSettings: DubCeraSettings): Promise<void> {
     if (this.disposed) return;
+    const prevEnabled = this.settings.enabled;
     const prevConfigVer = this.activeConfigVersion;
     const prevTransSig = this.activeTranslationSig;
     const prevEngineId = this.settings.engineId;
@@ -330,12 +331,14 @@ export class AdaptiveSyncCoordinator {
             : `Đã chọn giọng: ${builtinLabel} — Bấm Play để nghe`
           : `Đã chọn giọng: ${this.settings.voiceId} — Bấm Play để nghe`;
       }
-    } else if (!this.video.paused) {
+    } else if (!prevEnabled && !this.video.paused) {
       this.hasPlayedInSession = true;
       this.clearPauseGraceTimer();
       const alignedMs = this.alignPlayheadToSentenceStart();
       this.triggerBackgroundWorkers();
       void this.coordinateAtPlayhead(alignedMs);
+    } else if (!this.video.paused && !this.ttsDegradedSubtitleOnly) {
+      this.video.volume = Math.max(0, Math.min(1, nextSettings.originalVideoVolumeRatio));
     }
 
     this.emitSnapshot();
@@ -918,11 +921,16 @@ export class AdaptiveSyncCoordinator {
       while (this.isBackgroundWorkAllowed()) {
         const signal = this.workerAbortController.signal;
         const playheadMs = this.video.currentTime * 1000;
+        const isActivelyPlaying = !this.video.paused;
         const queue = buildPreemptiveQueue(this.segments, playheadMs, this.activeConfigVersion, {
           urgentWindowVideoMs: 25_000,
           urgentMinCount: 3,
-          maxLookaheadVideoMs: TRANSLATE_LOOKAHEAD_MS,
-          maxLookaheadCount: TRANSLATE_LOOKAHEAD_COUNT,
+          maxLookaheadVideoMs: isActivelyPlaying
+            ? Number.MAX_SAFE_INTEGER
+            : TRANSLATE_LOOKAHEAD_MS,
+          maxLookaheadCount: isActivelyPlaying
+            ? this.segments.length
+            : TRANSLATE_LOOKAHEAD_COUNT,
           includeBackfill: false,
         });
 
@@ -1049,11 +1057,12 @@ export class AdaptiveSyncCoordinator {
       while (!this.ttsDegradedSubtitleOnly && this.isBackgroundWorkAllowed()) {
         const signal = this.workerAbortController.signal;
         const playheadMs = this.video.currentTime * 1000;
+        const isActivelyPlaying = !this.video.paused;
         const queue = buildPreemptiveQueue(this.segments, playheadMs, this.activeConfigVersion, {
           urgentWindowVideoMs: 25_000,
           urgentMinCount: 2,
-          maxLookaheadVideoMs: TTS_LOOKAHEAD_MS,
-          maxLookaheadCount: TTS_LOOKAHEAD_COUNT,
+          maxLookaheadVideoMs: isActivelyPlaying ? Number.MAX_SAFE_INTEGER : TTS_LOOKAHEAD_MS,
+          maxLookaheadCount: isActivelyPlaying ? this.segments.length : TTS_LOOKAHEAD_COUNT,
           includeBackfill: false,
         });
 

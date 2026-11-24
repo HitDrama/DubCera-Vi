@@ -14,7 +14,8 @@ export default defineContentScript({
       controller.start(settings.fastTrackAutoTheater);
     });
 
-    chrome.storage?.onChanged?.addListener(() => {
+    chrome.storage?.onChanged?.addListener((changes, areaName) => {
+      if (areaName !== 'local' || !changes['dubcera_settings_v1']) return;
       void loadSettings().then((settings) => {
         controller.setAutoEnabled(settings.fastTrackAutoTheater);
       });

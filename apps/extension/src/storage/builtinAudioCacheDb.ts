@@ -11,6 +11,13 @@ export const BUILTIN_AUDIO_MAX_BYTES = 500 * 1024 * 1024;
 
 let lastAudioPruneCheckMs = 0;
 const PRUNE_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const activeProtectedAudioKeys = new Set<string>();
+
+export function markProtectedBuiltinAudioKeys(keys: ReadonlyArray<string>): void {
+  for (const k of keys) {
+    if (k) activeProtectedAudioKeys.add(k.toLowerCase());
+  }
+}
 
 export interface StoredBuiltinAudioRecord {
   audioCacheKey: string;
@@ -70,6 +77,8 @@ export async function pruneBuiltinAudioCache(minValidTimestampMs = 0): Promise<v
           valid.sort((a, b) => a.createdAtMs - b.createdAtMs);
           for (const rec of valid) {
             if (totalBytes <= BUILTIN_AUDIO_MAX_BYTES) break;
+            // Never evict audio belonging to the currently playing video
+            if (activeProtectedAudioKeys.has(rec.audioCacheKey.toLowerCase())) continue;
             store.delete(rec.audioCacheKey);
             totalBytes -= rec.sizeBytes;
           }
@@ -90,6 +99,7 @@ export async function getBuiltinCachedAudio(
   if (!audioCacheKey) return null;
   try {
     const cleanKey = audioCacheKey.toLowerCase();
+    activeProtectedAudioKeys.add(cleanKey);
     const db = await openAudioDatabase();
     return await new Promise<StoredBuiltinAudioRecord | null>((resolve) => {
       const tx = db.transaction(AUDIO_STORE_NAME, 'readwrite');

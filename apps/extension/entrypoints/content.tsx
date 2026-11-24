@@ -886,7 +886,8 @@ export default defineContentScript({
 
     setupExternalControlsCapture();
 
-    chrome.storage?.onChanged?.addListener(() => {
+    chrome.storage?.onChanged?.addListener((changes, areaName) => {
+      if (areaName !== 'local' || !changes['dubcera_settings_v1']) return;
       void (async () => {
         const nextSettings = await loadSettings();
         const cacheWasCleared = nextSettings.cacheInvalidatedAtMs > lastCacheInvalidatedAtMs;

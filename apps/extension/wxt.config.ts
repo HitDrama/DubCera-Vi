@@ -24,6 +24,8 @@ export default defineConfig({
       'https://*.fasttracktutorials.com/*',
       'https://iframe.mediadelivery.net/*',
       'https://*.b-cdn.net/*',
+      'https://*.thegnomonworkshop.com/*',
+      'https://*.kaltura.com/*',
     ],
   },
 });

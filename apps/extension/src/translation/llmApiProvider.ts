@@ -9,6 +9,28 @@ import {
 import { isContentScriptContext, sendBackgroundRpc } from '../bridges/extensionRpc';
 import { FreeWebTranslationProvider } from './freeWebProvider';
 
+const LLM_STATUS_STORAGE_KEY = 'dubcera_llm_status_v1';
+
+export interface LlmTranslationStatus {
+  ok: boolean;
+  provider: string;
+  model: string;
+  detail: string;
+  updatedAtMs: number;
+}
+
+function recordLlmStatus(status: LlmTranslationStatus): void {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      void chrome.storage.local.set({ [LLM_STATUS_STORAGE_KEY]: status });
+    }
+  } catch {
+    // Ignore restricted frame errors
+  }
+}
+
+export { LLM_STATUS_STORAGE_KEY };
+
 export interface LlmProviderConfig {
   provider: 'gemini' | 'groq' | 'openai-compatible';
   endpointUrl: string;
@@ -147,6 +169,7 @@ export class LlmApiTranslationProvider implements TranslationProvider {
       })),
     });
 
+    const startedAt = performance.now();
     try {
       const rawContent = await this.invokeModelJson(systemPrompt, userPayload, signal);
       const parsed = JSON.parse(extractJsonObjectText(rawContent)) as {
@@ -160,7 +183,7 @@ export class LlmApiTranslationProvider implements TranslationProvider {
         }
       }
 
-      return request.items.map((reqItem) => {
+      const mapped = request.items.map((reqItem) => {
         const translated = outMap.get(reqItem.segmentId);
         if (!translated) {
           throw new Error(`LLM omitted segmentId ${reqItem.segmentId}`);
@@ -170,10 +193,35 @@ export class LlmApiTranslationProvider implements TranslationProvider {
           translatedText: polishTranslatedVietnamese(translated, reqItem.sourceText),
         };
       });
+
+      const elapsedMs = Math.round(performance.now() - startedAt);
+      console.info(
+        `[DubCera][LLM] OK: ${this.config.provider}/${this.config.model} translated ${mapped.length} segments in ${elapsedMs}ms`,
+      );
+      recordLlmStatus({
+        ok: true,
+        provider: this.config.provider,
+        model: this.config.model,
+        detail: `Đang dịch thật bằng ${this.config.provider}/${this.config.model} (${mapped.length} câu · ${elapsedMs}ms)`,
+        updatedAtMs: Date.now(),
+      });
+      return mapped;
     } catch (err) {
       if (signal?.aborted) {
         throw err;
       }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[DubCera][LLM] FAILED (${this.config.provider}/${this.config.model}) -> fallback Google Translate:`,
+        errMsg,
+      );
+      recordLlmStatus({
+        ok: false,
+        provider: this.config.provider,
+        model: this.config.model,
+        detail: `Lỗi ${this.config.provider}/${this.config.model}: ${errMsg.slice(0, 140)} → Đang tạm dịch bằng Google Translate`,
+        updatedAtMs: Date.now(),
+      });
       // Graceful fallback to Smart Free Translator if API key is invalid or temporarily rate-limited
       return this.fallbackWebProvider.translateBatch(request, signal);
     }

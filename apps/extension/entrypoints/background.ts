@@ -7,6 +7,35 @@ import type {
 const activeSessionControllers = new Map<string, Set<AbortController>>();
 const NATIVE_VOICE_HOST_NAME = 'com.dubcera.voices';
 let nativeWakeInFlight: Promise<boolean> | null = null;
+const apiKeyCooldownUntilMs = new Map<string, number>();
+
+function parseApiKeyPool(raw: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of raw.split(/[\r\n,;]+/)) {
+    const k = part.trim();
+    if (k && !seen.has(k)) {
+      seen.add(k);
+      out.push(k);
+    }
+  }
+  return out;
+}
+
+function orderApiKeysByHealth(keys: string[]): string[] {
+  const now = Date.now();
+  const ready: string[] = [];
+  const cooled: string[] = [];
+  for (const k of keys) {
+    const until = apiKeyCooldownUntilMs.get(k) ?? 0;
+    if (until > now) {
+      cooled.push(k);
+    } else {
+      ready.push(k);
+    }
+  }
+  return [...ready, ...cooled];
+}
 
 function isLoopbackUrl(rawUrl: string): boolean {
   try {
@@ -137,56 +166,91 @@ async function handleAiLlmTranslate(
   msg: Extract<DubCeraRpcRequest, { type: 'AI_LLM_TRANSLATE' }>,
   signal: AbortSignal,
 ): Promise<string> {
-  const apiKey = msg.apiKey.trim();
-  if (!apiKey) {
+  const rawKeys = parseApiKeyPool(msg.apiKey);
+  if (rawKeys.length === 0) {
     throw new Error('Missing AI API key');
   }
+  const orderedKeys = orderApiKeysByHealth(rawKeys);
 
   if (msg.provider === 'gemini') {
-    const modelName = (msg.model || 'gemini-3.5-flash-lite').replace(/^models\//, '');
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const primaryModel = (msg.model || 'gemini-3.5-flash-lite').replace(/^models\//, '');
+    const candidateModels = [
+      primaryModel,
+      ...['gemini-2.5-flash-lite', 'gemini-2.5-flash'].filter((m) => m !== primaryModel),
+    ];
 
-    const resp = await fetch(geminiUrl, {
-      method: 'POST',
-      signal,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: msg.systemPrompt }],
-        },
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: msg.userPayload }],
-          },
-        ],
-        generationConfig: {
-          temperature: 0.2,
-          responseMimeType: 'application/json',
-        },
-      }),
-    });
+    let lastError: Error | null = null;
+    for (let kIdx = 0; kIdx < orderedKeys.length; kIdx++) {
+      const apiKey = orderedKeys[kIdx]!;
+      const keyLabel = `Key #${rawKeys.indexOf(apiKey) + 1}`;
 
-    if (!resp.ok) {
-      const detail = await resp.text().catch(() => '');
-      throw new Error(`Gemini HTTP ${resp.status}: ${detail.slice(0, 180)}`);
+      for (const modelName of candidateModels) {
+        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+        const resp = await fetch(geminiUrl, {
+          method: 'POST',
+          signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            systemInstruction: {
+              parts: [{ text: msg.systemPrompt }],
+            },
+            contents: [
+              {
+                role: 'user',
+                parts: [{ text: msg.userPayload }],
+              },
+            ],
+            generationConfig: {
+              temperature: 0.2,
+              responseMimeType: 'application/json',
+            },
+          }),
+        });
+
+        if (!resp.ok) {
+          const detail = await resp.text().catch(() => '');
+          lastError = new Error(
+            `Gemini [${keyLabel} · ${modelName}] HTTP ${resp.status}: ${detail.slice(0, 140)}`,
+          );
+          if (resp.status === 400 || resp.status === 401 || resp.status === 403) {
+            // Invalid/revoked key -> cool down 10 min and immediately rotate to next key
+            apiKeyCooldownUntilMs.set(apiKey, Date.now() + 10 * 60_000);
+            break;
+          }
+          if (resp.status === 429) {
+            // Quota/rate-limited key -> cool down 60s and rotate to next key
+            apiKeyCooldownUntilMs.set(apiKey, Date.now() + 60_000);
+            break;
+          }
+          if (resp.status === 503 || resp.status === 404) {
+            // Try next fallback Gemini model on same key first
+            continue;
+          }
+          break;
+        }
+
+        const body = (await resp.json()) as {
+          candidates?: Array<{
+            content?: { parts?: Array<{ text?: string }> };
+          }>;
+        };
+        const rawText =
+          body.candidates?.[0]?.content?.parts
+            ?.map((p) => p.text ?? '')
+            .join('')
+            .trim() ?? '';
+
+        if (!rawText) {
+          lastError = new Error(`Gemini [${keyLabel} · ${modelName}] returned empty content`);
+          continue;
+        }
+        apiKeyCooldownUntilMs.delete(apiKey);
+        return rawText;
+      }
     }
 
-    const body = (await resp.json()) as {
-      candidates?: Array<{
-        content?: { parts?: Array<{ text?: string }> };
-      }>;
-    };
-    const rawText =
-      body.candidates?.[0]?.content?.parts
-        ?.map((p) => p.text ?? '')
-        .join('')
-        .trim() ?? '';
-
-    if (!rawText) {
-      throw new Error('Gemini returned empty content');
-    }
-    return rawText;
+    throw lastError ?? new Error('All Gemini API keys failed');
   }
 
   const endpoint =
@@ -195,38 +259,57 @@ async function handleAiLlmTranslate(
       : msg.endpointUrl.trim() || 'https://api.openai.com/v1/chat/completions';
 
   const defaultModel = msg.provider === 'groq' ? 'llama-3.3-70b-versatile' : 'gpt-4o-mini';
+  let lastError: Error | null = null;
 
-  const resp = await fetch(endpoint, {
-    method: 'POST',
-    signal,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: msg.model.trim() || defaultModel,
-      temperature: 0.2,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: msg.systemPrompt },
-        { role: 'user', content: msg.userPayload },
-      ],
-    }),
-  });
+  for (let kIdx = 0; kIdx < orderedKeys.length; kIdx++) {
+    const apiKey = orderedKeys[kIdx]!;
+    const keyLabel = `Key #${rawKeys.indexOf(apiKey) + 1}`;
 
-  if (!resp.ok) {
-    const detail = await resp.text().catch(() => '');
-    throw new Error(`LLM HTTP ${resp.status}: ${detail.slice(0, 180)}`);
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      signal,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: msg.model.trim() || defaultModel,
+        temperature: 0.2,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: msg.systemPrompt },
+          { role: 'user', content: msg.userPayload },
+        ],
+      }),
+    });
+
+    if (!resp.ok) {
+      const detail = await resp.text().catch(() => '');
+      lastError = new Error(`LLM [${keyLabel}] HTTP ${resp.status}: ${detail.slice(0, 140)}`);
+      if (resp.status === 401 || resp.status === 403) {
+        apiKeyCooldownUntilMs.set(apiKey, Date.now() + 10 * 60_000);
+        continue;
+      }
+      if (resp.status === 429 || resp.status === 503) {
+        apiKeyCooldownUntilMs.set(apiKey, Date.now() + 60_000);
+        continue;
+      }
+      continue;
+    }
+
+    const body = (await resp.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const rawContent = body.choices?.[0]?.message?.content?.trim() ?? '';
+    if (!rawContent) {
+      lastError = new Error(`LLM [${keyLabel}] returned empty content`);
+      continue;
+    }
+    apiKeyCooldownUntilMs.delete(apiKey);
+    return rawContent;
   }
 
-  const body = (await resp.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const rawContent = body.choices?.[0]?.message?.content?.trim() ?? '';
-  if (!rawContent) {
-    throw new Error('LLM returned empty content');
-  }
-  return rawContent;
+  throw lastError ?? new Error('All LLM API keys failed');
 }
 
 async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
@@ -464,7 +547,9 @@ async function handleRpc(msg: DubCeraRpcRequest): Promise<unknown> {
           host === 'udemy.com' ||
           host.endsWith('.youtube.com') ||
           host === 'iframe.mediadelivery.net' ||
-          host.endsWith('.b-cdn.net'));
+          host.endsWith('.b-cdn.net') ||
+          host.endsWith('.kaltura.com') ||
+          host.endsWith('.thegnomonworkshop.com'));
       if (!isAllowedSubtitleHost) {
         throw new Error(`Disallowed subtitle host: ${host}`);
       }

@@ -36,9 +36,26 @@ class AtomicAudioCacheStore:
         self.max_bytes = max_bytes
         self.ttl_seconds = ttl_seconds
         self._last_access_map: dict[str, float] = {}
+        # Keys belonging to the currently playing video are protected from LRU quota eviction
+        self._protected_until_map: dict[str, float] = {}
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         # Immediately sweep expired (>1 day) and over-quota (>5 GB) files on startup
         self.enforce_quota()
+
+    def protect_keys(self, keys: list[str], ttl_sec: float = 4 * 3600.0) -> None:
+        deadline = time.time() + ttl_sec
+        for key in keys:
+            if key and key.isalnum():
+                self._protected_until_map[key.lower()] = deadline
+
+    def _is_protected(self, clean_key: str, now: float) -> bool:
+        until = self._protected_until_map.get(clean_key)
+        if until is None:
+            return False
+        if until <= now:
+            self._protected_until_map.pop(clean_key, None)
+            return False
+        return True
 
     def _wav_path(self, key: str) -> Path:
         return self.cache_dir / f"{key.lower()}.wav"
@@ -93,6 +110,7 @@ class AtomicAudioCacheStore:
 
         # Track LRU access strictly in-memory so file creation/mtime TTL is never artificially extended
         self._last_access_map[clean_key] = now
+        self._protected_until_map[clean_key] = now + 4 * 3600.0
 
         return CachedAudioRecord(
             cache_key=clean_key,
@@ -104,6 +122,7 @@ class AtomicAudioCacheStore:
         )
 
     def verify_many(self, keys: list[str]) -> dict[str, CachedAudioRecord]:
+        self.protect_keys(keys)
         self.enforce_quota()
         valid: dict[str, CachedAudioRecord] = {}
         for key in keys:
@@ -149,6 +168,7 @@ class AtomicAudioCacheStore:
             os.replace(tmp_wav, final_wav)
             os.replace(tmp_meta, final_meta)
             self._last_access_map[clean_key] = now_sec
+            self._protected_until_map[clean_key] = now_sec + 4 * 3600.0
         finally:
             if tmp_wav.exists():
                 tmp_wav.unlink(missing_ok=True)
@@ -169,6 +189,7 @@ class AtomicAudioCacheStore:
     def evict(self, key: str) -> None:
         clean_key = key.lower()
         self._last_access_map.pop(clean_key, None)
+        self._protected_until_map.pop(clean_key, None)
         self._wav_path(clean_key).unlink(missing_ok=True)
         self._meta_path(clean_key).unlink(missing_ok=True)
 
@@ -177,6 +198,7 @@ class AtomicAudioCacheStore:
         deleted_wavs = 0
         freed_bytes = 0
         self._last_access_map.clear()
+        self._protected_until_map.clear()
 
         for p in list(self.cache_dir.iterdir()):
             if not p.is_file():
@@ -252,16 +274,30 @@ class AtomicAudioCacheStore:
             except OSError:
                 continue
 
-        # 3. Hard 5 GB cap: immediately evict oldest entries until total_bytes <= max_bytes
+        # 3. Hard 5 GB cap:
+        #    Pass 1: evict oldest UNPROTECTED entries first so the currently playing video is spared.
+        #    Pass 2: only if still over hard cap after all other videos are evicted, evict oldest protected entries.
         if total_bytes <= self.max_bytes:
             return evicted
 
-        active_entries.sort(key=lambda entry: (entry[0], entry[1]))
-        for _, _, entry_bytes, stem_key in active_entries:
+        unprotected = [e for e in active_entries if not self._is_protected(e[3], now)]
+        protected = [e for e in active_entries if self._is_protected(e[3], now)]
+
+        unprotected.sort(key=lambda entry: (entry[0], entry[1]))
+        for _, _, entry_bytes, stem_key in unprotected:
             if total_bytes <= self.max_bytes:
                 break
             self.evict(stem_key)
             total_bytes -= entry_bytes
             evicted += 1
+
+        if total_bytes > self.max_bytes:
+            protected.sort(key=lambda entry: (entry[0], entry[1]))
+            for _, _, entry_bytes, stem_key in protected:
+                if total_bytes <= self.max_bytes:
+                    break
+                self.evict(stem_key)
+                total_bytes -= entry_bytes
+                evicted += 1
 
         return evicted
